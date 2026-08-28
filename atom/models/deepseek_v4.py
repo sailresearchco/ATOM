@@ -3885,6 +3885,8 @@ class MoE(nn.Module):
         self,
         x: torch.Tensor,  # [num_tokens, dim]
         shared_partial: torch.Tensor | None = None,
+        before_stage2=None,
+        stage2_stream: torch.cuda.Stream | None = None,
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Gate + FusedMoE routed-expert pass.
 
@@ -3895,11 +3897,18 @@ class MoE(nn.Module):
         """
         router_logits = self.gate(x)  # [num_tokens, n_routed_experts]
         if self._use_comm_fused(x):
-            return self.experts.forward_comm_fused(
-                x,
-                router_logits,
-                shared_partial,
-            )
+            if before_stage2 is not None:
+                # dual_stream_moe_forward already runs inside the opaque
+                # maybe_dual_stream_forward custom op, so invoke the real
+                # implementation directly and keep the fork/join in one op.
+                return self.experts.forward_comm_fused_impl(
+                    x,
+                    router_logits,
+                    shared_partial,
+                    before_stage2=before_stage2,
+                    stage2_stream=stage2_stream,
+                )
+            return self.experts.forward_comm_fused(x, router_logits, shared_partial)
         return self.experts(hidden_states=x, router_logits=router_logits)
 
     def _use_comm_fused(self, x: torch.Tensor) -> bool:
@@ -3979,6 +3988,31 @@ class MoE(nn.Module):
         combining.
         """
         current_stream = get_forward_context().main_stream
+        if self._use_comm_fused(x):
+            # Nested custom-op execution can use a different capture stream
+            # from ForwardContext.main_stream.  Stage1 follows the active
+            # stream at entry, so use that exact stream for both dependencies
+            # and for the Stage2 override.
+            routed_stream = torch.cuda.current_stream(x.device)
+            self.alt_stream.wait_stream(routed_stream)
+
+            def produce_shared():
+                # Match the proven ordinary dual-stream enqueue order: Stage1
+                # is already queued on routed_stream when this callback runs,
+                # while alt_stream is free to execute the shared expert from
+                # the fork point above.
+                with torch.cuda.stream(self.alt_stream):
+                    shared = self.shared_experts.forward(x)
+                routed_stream.wait_stream(self.alt_stream)
+                shared.record_stream(routed_stream)
+                return shared
+
+            with torch.cuda.stream(routed_stream):
+                return self.routed_expert_forward(
+                    x,
+                    before_stage2=produce_shared,
+                    stage2_stream=routed_stream,
+                )
         self.alt_stream.wait_stream(current_stream)
         routed = self.routed_expert_forward(x)
         with torch.cuda.stream(self.alt_stream):
@@ -3998,8 +4032,6 @@ class MoE(nn.Module):
         assert (
             x.dim() == 2 and x.shape[-1] == self.dim
         ), f"MoE expects 2D [num_tokens, {self.dim}], got {tuple(x.shape)}"
-        if self._use_comm_fused(x):
-            return self.single_stream_moe_forward(x)
         if self._use_dual_stream:
             # Shared custom op (also used by V2). Dispatcher reads
             # `_use_dual_stream` + per-call num_tokens vs threshold to pick

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import os
 
 import torch
@@ -87,6 +88,7 @@ class CommFusedMoe(FusedMoE):
                 inter_dim=self.intermediate_size_per_partition,
                 experts=self.global_num_experts,
                 topk=self.top_k,
+                isolate_small=True,
             )
         )
 
@@ -110,7 +112,9 @@ class CommFusedMoe(FusedMoE):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
-        shared_partial: torch.Tensor,
+        shared_partial: torch.Tensor | None,
+        before_stage2: Callable[[], torch.Tensor] | None = None,
+        stage2_stream: torch.cuda.Stream | None = None,
     ) -> torch.Tensor:
         method = self.quant_method
         topk_weights, topk_ids = method.select_experts_with_record(
@@ -153,6 +157,8 @@ class CommFusedMoe(FusedMoE):
                 else GateMode.SEPARATED.value
             ),
             shared_partial=shared_partial,
+            before_stage2=before_stage2,
+            stage2_stream=stage2_stream,
         )
 
 
