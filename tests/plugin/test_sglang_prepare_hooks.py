@@ -103,7 +103,7 @@ def test_prepare_model_register_ops_gate(model_arch: str):
             "atom.plugin.config": fake_config_mod,
             "atom.plugin.sglang.runtime": fake_runtime_mod,
             "atom.plugin.sglang.models.qwen3_5": fake_qwen35_mod,
-            "atom.plugin.sglang.graph_capture_patch": MagicMock(
+            "atom.plugin.sglang.patches.graph_capture_patch": MagicMock(
                 apply_graph_capture_patch=MagicMock()
             ),
         },
@@ -154,7 +154,7 @@ def test_prepare_model_uses_canonical_family_architecture():
             "atom.plugin.register": fake_register,
             "atom.plugin.config": fake_config_mod,
             "atom.plugin.sglang.runtime": fake_runtime_mod,
-            "atom.plugin.sglang.graph_capture_patch": MagicMock(
+            "atom.plugin.sglang.patches.graph_capture_patch": MagicMock(
                 apply_graph_capture_patch=MagicMock()
             ),
         },

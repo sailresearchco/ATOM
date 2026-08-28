@@ -40,6 +40,7 @@ from atom.plugin.sglang.attention_backend.attention_gdn import (
 from atom.plugin.sglang.runtime import (
     SGLangForwardBatchMetadata,
     SGLangPluginRuntime,
+    get_model_arch_spec,
     plugin_runtime_scope,
 )
 
@@ -124,9 +125,14 @@ def remap_qwen35_quant_config_for_sglang_plugin(atom_config: Any) -> None:
 
 
 def apply_prepare_model_adaptations(atom_config: Any, model_arch: str) -> None:
-    if model_arch == "Qwen3_5MoeForConditionalGeneration":
+    if model_arch in {
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+    }:
         _patch_qwen35_moe_text_for_sparse_moe_block(atom_config.hf_config)
     if model_arch in {
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForCausalLM",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
     }:
@@ -229,6 +235,8 @@ def _get_qwen35_language_model_stack_cls(
             self.config = atom_lm.config
             self.quant_config = quant_config or atom_lm.atom_config.quant_config
             self.atom_config = atom_lm.atom_config
+            self.model_arch = getattr(root_config, "architectures", [""])[0]
+            self.model_arch_spec = get_model_arch_spec(self.model_arch)
             self.model = atom_lm.model
             self.make_empty_intermediate_tensors = (
                 atom_lm.make_empty_intermediate_tensors
@@ -331,8 +339,12 @@ def _get_qwen35_language_model_stack_cls(
                     input_ids=input_ids,
                     input_embeds=inputs_embeds,
                     set_forward_context=True,
+                    save_kv_cache=save_kv_cache,
                 ) as runtime,
             ):
+                if self.model_arch_spec.bind_cache_views is not None:
+                    self.model_arch_spec.bind_cache_views(self.model, runtime)
+
                 metadata = SGLangForwardBatchMetadata.build(
                     runtime.forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
