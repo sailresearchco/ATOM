@@ -5,11 +5,11 @@
 
 from __future__ import annotations
 
+import importlib
+import pkgutil
 from functools import cache
 from pathlib import Path
 from typing import Any, ClassVar
-import importlib
-import pkgutil
 
 
 class MPModelConnectorPlugin:
