@@ -25,21 +25,23 @@ rank-local retrieve failures visible.
 - no PP, DCP, PCP, data parallelism, or DP Attention yet
 - LMCache's `auto` (ROCm IPC handle) or `lmcache_driven` transfer mode;
   `engine_driven` cannot represent the two physical cache groups
-- LMCache native ATOM MP API from
-  [LMCache#4662](https://github.com/LMCache/LMCache/pull/4662)
+- LMCache v0.5.5rc1 or newer, including the native ATOM MP API from
+  [LMCache#4662](https://github.com/LMCache/LMCache/pull/4662) and the
+  missing-registration terminal response from
+  [LMCache#4709](https://github.com/LMCache/LMCache/pull/4709)
 
 `lmcache_mp` is the stable public connector name. Its plugin registry discovers
 the `atom.kv_transfer.offload.mp.glm52` implementation for
 `model_type == "glm_moe_dsa"`.
 
-ATOM's Docker images install the v0.5.3 ROCm wheel for its prebuilt storage
-extensions, then overlay the complete Python package from the pinned
-LMCache#4662 revision and rebuild both `lmcache_native` and the HIP `c_ops`
-extension against the image's PyTorch. This full overlay is required:
-overriding only LMCache's vLLM adapter does not install
-`lmcache.integration.atom`, `EngineType.ATOM`, or ATOM cache-format detection.
-Until LMCache#4662 merges, external images must fetch that PR ref (or the same
-immutable commit) rather than installing the v0.5.3 wheel alone.
+ATOM's Docker images pin the v0.5.5rc1 ROCm wheel and its immutable release
+commit. They retain the wheel's matching Python and storage-extension payload,
+then rebuild `lmcache_native` and the HIP `cuda_ops` extension against the
+image's PyTorch ABI. The dedicated ROCm 7.2.4 / torch 2.10 release artifact
+introduced by [LMCache#4683](https://github.com/LMCache/LMCache/pull/4683) was
+not published for v0.5.5rc1, so the rebuild remains necessary for this pin.
+Do not substitute the wheel's bundled `cuda_ops` into an ATOM image with a
+different PyTorch ABI.
 
 The connector uses a layout-specific model namespace, so its objects cannot be
 mixed with objects written by vLLM's connector or ATOM's legacy connector.
@@ -165,6 +167,14 @@ server failure; after it expires the request fails closed to recomputation.
 Use a smaller value only after confirming that startup and heartbeat
 re-registration fit within it on the target node.
 
+A replacement server that is observed as unhealthy and then healthy triggers
+worker re-registration. A fast replacement entirely between two successful
+heartbeat probes is different: PING confirms server reachability, not that the
+new server still owns this worker's registration. LMCache returns an event-free
+`False` for subsequent transfers, so requests terminate safely and recompute,
+but remote caching remains unavailable until the worker restarts or a heartbeat
+observes an unhealthy-to-healthy transition.
+
 That recomputation path applies when lookup fails or the worker drops a transfer
 before submission. If the server becomes unhealthy after device work is already
 in flight, ATOM keeps the request pending until LMCache's device future proves
@@ -195,5 +205,9 @@ rank stores 56,160 bytes per token (`78 * (576 + 144)`), so TP8 consumes
   are released when the ATOM worker process exits.
 - Lookup admission is synchronous; an unresponsive control plane can stall the
   scheduler for up to the configured MQ timeout before recomputation begins.
+- A server replacement between two successful heartbeat probes can lose worker
+  registrations without triggering automatic re-registration. Transfers then
+  fail safely to local recomputation, but restoring remote caching requires an
+  ATOM worker restart unless a later heartbeat observes an unhealthy transition.
 - A permanent server failure during an in-flight GPU transfer is fail-stop for
   the affected request; restart the ATOM engine to recover it safely.

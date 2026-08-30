@@ -369,6 +369,7 @@ class _LookupState:
     token_ids: list[int]
     hit: int | None = None
     retrieve_start: int | None = None
+    retrieve_end: int | None = None
 
 
 @dataclass
@@ -449,8 +450,32 @@ class _MPLookupClient:
                 return 0
             time.sleep(self._poll_interval)
 
-    def prepare_retrieve(self, lookup_id: str, start: int) -> None:
+    def prepare_retrieve(
+        self,
+        lookup_id: str,
+        start: int,
+        end: int | None = None,
+    ) -> None:
+        """Hand one subrange of a lookup hit to the worker retrieve.
+
+        The worker owns and releases locks in ``[start, end)``. Any hit prefix
+        already resident in HBM and any hit suffix beyond ``end`` will not be
+        consumed by that retrieve, so release those locks here.
+        """
+        if start < 0 or (end is not None and end < start):
+            raise ValueError(
+                f"invalid retrieve range for {lookup_id}: start={start}, end={end}"
+            )
         state = self._lookups.get(lookup_id)
+        if (
+            state is not None
+            and state.hit is not None
+            and end is not None
+            and end > state.hit
+        ):
+            raise ValueError(
+                f"retrieve end {end} exceeds lookup hit {state.hit} for {lookup_id}"
+            )
         if state is not None and state.hit is not None and start > 0:
             self._adapter.free_lookup_locks(
                 token_ids=state.token_ids,
@@ -458,8 +483,21 @@ class _MPLookupClient:
                 end=min(start, state.hit),
                 request_id=lookup_id,
             )
+        if (
+            state is not None
+            and state.hit is not None
+            and end is not None
+            and end < state.hit
+        ):
+            self._adapter.free_lookup_locks(
+                token_ids=state.token_ids,
+                start=end,
+                end=state.hit,
+                request_id=lookup_id,
+            )
         if state is not None:
             state.retrieve_start = start
+            state.retrieve_end = end
         self._adapter.cleanup_lookup_result(lookup_id)
 
     def complete_retrieve(self, lookup_id: str, *, succeeded: bool) -> None:
@@ -645,9 +683,7 @@ class GLM52LMCacheMPConnector(KVConnectorBase):
             if req.save_spec is not None and self._do_save:
                 self._submit_save(req, event)
 
-    def _block_slice(
-        self, req: LMCacheReqMeta, start: int, end: int
-    ) -> list[int]:
+    def _block_slice(self, req: LMCacheReqMeta, start: int, end: int) -> list[int]:
         if start < 0 or end < start:
             raise ValueError(f"invalid LMCache MP token range [{start}, {end})")
         if start % self.block_size or end % self.block_size:
@@ -787,29 +823,11 @@ class GLM52LMCacheMPConnector(KVConnectorBase):
         failed_load: set[LoadCompletionId] = set()
         done_save: set[SaveCompletionId] = set()
         with self._lock:
-            # Match vLLM's degraded-mode policy: once the MP server is
-            # unhealthy, abandon every pending retrieve and let the scheduler
-            # recompute into the blocks it already allocated. Stores are
-            # terminal from the scheduler's perspective because losing one
-            # cache opportunity must not retain finished-request blocks.
-            if not self._adapter.is_healthy:
-                done_save.update(
-                    pending.completion for pending in self._pending_saves.values()
-                )
-                failed_load.update(
-                    pending.completion for pending in self._pending_loads.values()
-                )
-                self._pending_saves.clear()
-                self._pending_loads.clear()
-                done_save.update(self._immediate_saves)
-                failed_load.update(self._immediate_load_failures)
-                self._immediate_saves.clear()
-                self._immediate_load_failures.clear()
-                return KVConnectorOutput(
-                    failed_loading=failed_load,
-                    finished_saving=done_save,
-                )
-
+            # Heartbeat health is a control-plane signal, not proof that GPU
+            # work submitted before the failure has quiesced. Keep every real
+            # future until its device event is terminal. A pre-submit drop is
+            # represented by None, while LMCache's missing-registration path
+            # returns an event-free terminal False future.
             for operation_id, pending in list(self._pending_saves.items()):
                 terminal, _result = _terminal_future_result(pending.future)
                 if terminal:
@@ -895,9 +913,13 @@ class GLM52LMCacheMPConnectorScheduler(DenseOffloadScheduler):
         metadata = super().build_connector_meta()
         for req in metadata.requests:
             if req.load_spec is not None:
+                end = req.load_spec.transfer_end_tokens
+                if end is None:
+                    end = req.load_spec.lmcache_cached_tokens
                 self._lookup_client.prepare_retrieve(
                     str(req.req_id),
                     int(req.load_spec.hbm_cached_tokens),
+                    int(end),
                 )
         return metadata
 

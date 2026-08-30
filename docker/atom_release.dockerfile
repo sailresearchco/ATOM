@@ -1,6 +1,6 @@
 # Keep the release reproducible on the ROCm 7.2.4 / PyTorch 2.10 stack.
 # The digest prevents this historical tag from being moved underneath us.
-ARG BASE_IMAGE="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0"
+ARG BASE_IMAGE="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0@sha256:4449f856653602317e4101a76fce599c7fcd58ccec2e539951fce5f73083179e"
 ARG GPU_ARCH="gfx942;gfx950"
 
 # ====================================================================
@@ -214,41 +214,40 @@ RUN echo "========== Install atomesh binary ==========" && \
     cp target/release/atomesh /usr/local/bin/atomesh && \
     atomesh --version
 
-# ========== LMCache (HIP c_ops) for KV offload ==========
+# ========== LMCache (HIP cuda_ops) for KV offload ==========
 # The official ROCm wheel supplies LMCache's Python code and common native
-# storage extensions, but its bundled c_ops is built against the release
-# PyTorch ABI. ATOM images may carry a newer ROCm PyTorch, so rebuild c_ops
+# storage extensions, but its bundled cuda_ops is built against the release
+# PyTorch ABI. ATOM images may carry a newer ROCm PyTorch, so rebuild cuda_ops
 # against the image's torch and also rebuild the format-defining lmcache_native
 # extension. Building the whole source package would additionally
 # compile unrelated Redis/filesystem extensions and can exceed builder memory.
-# Native ATOM MP support is stacked on LMCache#4662 until that PR merges.
-# Fetch the PR ref explicitly so its immutable commit is available from the
-# upstream repository; update both values to the upstream merge commit later.
-ARG LMCACHE_REFSPEC=refs/pull/4662/head
-ARG LMCACHE_COMMIT=4232f111ea967b419662c404f5e4b8ee1f2f6c7d
-ARG LMCACHE_WHEEL_URL=https://github.com/LMCache/LMCache/releases/download/v0.5.3-rocm/lmcache-0.5.3-cp312-cp312-manylinux_2_35_x86_64.whl
-ARG LMCACHE_WHEEL_SHA256=6406280fa2762a6314018926d4f2d4178e05f605a32bfdb1971b85bacd1ebae4
+# v0.5.5rc1 contains the merged native ATOM MP API and missing-registration
+# terminal-response fix. Keep the source and wheel on the same release commit.
+# The dedicated torch-2.10 artifact was not published for this RC, so rebuild
+# the two torch-linked/format-defining extensions against the image's torch.
+ARG LMCACHE_COMMIT=0c2a6801b7ad8ad714c40c44f727358dfc3a4261
+ARG LMCACHE_WHEEL_NAME=lmcache-0.5.5rc1+rocm7.2-cp312-cp312-manylinux_2_35_x86_64.whl
+ARG LMCACHE_WHEEL_URL=https://github.com/LMCache/LMCache/releases/download/v0.5.5rc1-rocm/lmcache-0.5.5rc1%2Brocm7.2-cp312-cp312-manylinux_2_35_x86_64.whl
+ARG LMCACHE_WHEEL_SHA256=79f76686afe4280070e8f61c24683550f6dcbbf965cd14a1cdeadd9164a0073d
 # PYTORCH_ROCM_ARCH is inherited as ENV from the `base` stage (=${GPU_ARCH});
 # hipcc reads it to target both gfx942 and gfx950. Do not re-derive from
 # ${GPU_ARCH} here — ARG does not cross FROM so it would be empty in this stage.
 # Docker builds do not expose a GPU, so LMCache's torch.cuda.is_available()
 # backend predicate is overridden only in the validation process below.
-RUN echo "========== [ATOM] LMCache HIP c_ops (${LMCACHE_COMMIT}, arch=${PYTORCH_ROCM_ARCH}) ==========" && \
-    curl -fL "${LMCACHE_WHEEL_URL}" -o /tmp/lmcache-0.5.3-cp312-cp312-manylinux_2_35_x86_64.whl && \
-    echo "${LMCACHE_WHEEL_SHA256}  /tmp/lmcache-0.5.3-cp312-cp312-manylinux_2_35_x86_64.whl" | sha256sum -c - && \
-    "${VENV_PYTHON}" -m pip install --no-deps /tmp/lmcache-0.5.3-cp312-cp312-manylinux_2_35_x86_64.whl && \
+RUN echo "========== [ATOM] LMCache HIP cuda_ops (${LMCACHE_COMMIT}, arch=${PYTORCH_ROCM_ARCH}) ==========" && \
+    curl -fL "${LMCACHE_WHEEL_URL}" -o "/tmp/${LMCACHE_WHEEL_NAME}" && \
+    echo "${LMCACHE_WHEEL_SHA256}  /tmp/${LMCACHE_WHEEL_NAME}" | sha256sum -c - && \
+    "${VENV_PYTHON}" -m pip install --no-deps "/tmp/${LMCACHE_WHEEL_NAME}" && \
     git clone https://github.com/LMCache/LMCache.git /opt/LMCache && \
-    cd /opt/LMCache && git fetch origin "${LMCACHE_REFSPEC}" && \
-    git checkout "${LMCACHE_COMMIT}" && \
+    cd /opt/LMCache && git checkout "${LMCACHE_COMMIT}" && \
     "${VENV_PYTHON}" -m pip install -r requirements/build.txt && \
     MAX_JOBS=4 "${VENV_PYTHON}" -c "from setuptools import setup; from setup_extensions.common_cpp import build_common_cpp; extensions, commands = build_common_cpp(); native = next(ext for ext in extensions if ext.name == 'lmcache.lmcache_native'); setup(name='lmcache-native', version='0.0.0', ext_modules=[native], cmdclass=commands, script_args=['build_ext', '--inplace'])" && \
     CXX=hipcc BUILD_WITH_HIP=1 MAX_JOBS=4 \
       "${VENV_PYTHON}" -c "from setuptools import setup; from setup_extensions.build_profiles.rocm import RocmProfile; extensions, commands = RocmProfile().build(); setup(name='lmcache-rocm-c-ops', ext_modules=extensions, cmdclass=commands, script_args=['build_ext', '--inplace'])" && \
     LMCACHE_SITE=$("${VENV_PYTHON}" -c "import sysconfig; print(sysconfig.get_path('purelib'))") && \
     test -f /opt/LMCache/lmcache/integration/atom/multi_process_adapter.py && \
-    cp -a /opt/LMCache/lmcache/. "${LMCACHE_SITE}/lmcache/" && \
-    cp /opt/LMCache/lmcache/c_ops*.so /opt/LMCache/lmcache/lmcache_native*.so "${LMCACHE_SITE}/lmcache/" && \
-    rm -f /tmp/lmcache-0.5.3-cp312-cp312-manylinux_2_35_x86_64.whl && \
+    cp /opt/LMCache/lmcache/cuda_ops*.so /opt/LMCache/lmcache/lmcache_native*.so "${LMCACHE_SITE}/lmcache/" && \
+    rm -f "/tmp/${LMCACHE_WHEEL_NAME}" && \
     "${VENV_PYTHON}" -m pip install \
         prometheus_client==0.25.0 aiofile==3.11.1 aiofiles caio==0.9.25 \
         blake3 redis sortedcontainers pyzmq cupy-rocm-7-0 \
@@ -256,25 +255,26 @@ RUN echo "========== [ATOM] LMCache HIP c_ops (${LMCACHE_COMMIT}, arch=${PYTORCH
         opentelemetry-api==1.40.0 opentelemetry-sdk==1.40.0 \
         opentelemetry-exporter-otlp==1.40.0 \
         opentelemetry-exporter-prometheus==0.61b0 && \
-    "${VENV_PYTHON}" -c "import glob, os, sysconfig, torch; torch.cuda.is_available = lambda: True; import lmcache, lmcache.c_ops; \
+    "${VENV_PYTHON}" -c "import glob, os, sysconfig, torch; torch.cuda.is_available = lambda: True; import lmcache, lmcache.cuda_ops; \
 from lmcache.v1.cache_engine import LMCacheEngineBuilder; \
 from lmcache.v1.memory_management import MemoryFormat; \
 from lmcache.v1.lookup_client.factory import LookupClientFactory; \
 from lmcache.v1.config import LMCacheEngineConfig; \
 from lmcache.v1.metadata import LMCacheMetadata; \
-from lmcache.integration.atom import AtomMPSchedulerAdapter, AtomMPWorkerAdapter; \
+from lmcache.integration.atom import AtomMPSchedulerAdapter, AtomMPTransferSpec, AtomMPWorkerAdapter; \
 from lmcache.utils import EngineType; \
-from lmcache.v1.multiprocess.futures import TransferHandle; \
+from lmcache.v1.multiprocess.futures import DeviceMessagingFuture; \
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo; \
-c_ops_paths = glob.glob(os.path.join(sysconfig.get_path('purelib'), 'lmcache', 'c_ops*.so')); \
+cuda_ops_paths = glob.glob(os.path.join(sysconfig.get_path('purelib'), 'lmcache', 'cuda_ops*.so')); \
 assert 'rocm' in torch.__version__, torch.__version__; \
-assert c_ops_paths, 'LMCache HIP c_ops extension was not installed'; \
-assert hasattr(lmcache.c_ops, 'execute_object_group_transfer'), 'c_ops fell back to torch backend'; \
+assert cuda_ops_paths, 'LMCache HIP cuda_ops extension was not installed'; \
+assert hasattr(lmcache.cuda_ops, 'execute_object_group_transfer'), 'cuda_ops extension is incomplete'; \
 assert EngineType.ATOM.value == 'atom'; \
-assert TransferHandle.__module__ == 'lmcache.v1.multiprocess.futures'; \
+assert DeviceMessagingFuture.__module__ == 'lmcache.v1.multiprocess.futures'; \
+assert AtomMPTransferSpec.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
 assert AtomMPSchedulerAdapter.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
 assert AtomMPWorkerAdapter.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
-print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)"
+print('OK: lmcache', lmcache.__version__, 'HIP cuda_ops; torch', torch.__version__)"
 
 # ========== SemiAnalysis aiperf agentic benchmark tool ==========
 # Install the SemiAnalysis fork pinned to the commit that supports the SA

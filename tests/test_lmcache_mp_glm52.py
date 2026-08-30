@@ -18,6 +18,7 @@ from atom.kv_transfer.disaggregation.types import (
     SaveOperationId,
 )
 from atom.kv_transfer.offload.metadata import (
+    LMCacheOffloadMetadata,
     LMCacheReqMeta,
     LoadSpec,
     SaveSpec,
@@ -301,6 +302,67 @@ def test_mp_lookup_releases_only_hbm_prefix_after_retrieve_handoff(monkeypatch):
     # on terminal failure. The scheduler releases only the HBM-resident prefix.
     assert [(call["start"], call["end"]) for call in adapter.freed] == [(0, 4)]
     assert client.hit_tokens("req") is None
+
+
+def test_mp_lookup_releases_hit_suffix_outside_retrieve_range(monkeypatch):
+    monkeypatch.setattr(mp_connector.time, "sleep", lambda _seconds: None)
+    adapter = _LookupAdapter([12])
+    client = mp_connector._MPLookupClient(
+        adapter,
+        timeout=10.0,
+        poll_interval=0.01,
+    )
+
+    assert client.lookup(list(range(12)), "req") == 12
+    metadata = LMCacheOffloadMetadata()
+    metadata.add_request(
+        LMCacheReqMeta(
+            req_id="req",
+            token_ids=list(range(8)),
+            block_ids=[1, 2],
+            load_spec=LoadSpec(
+                hbm_cached_tokens=2,
+                lmcache_cached_tokens=12,
+                can_load=True,
+                transfer_end_tokens=8,
+            ),
+        )
+    )
+    scheduler = mp_connector.GLM52LMCacheMPConnectorScheduler.__new__(
+        mp_connector.GLM52LMCacheMPConnectorScheduler
+    )
+    scheduler._lookup_client = client
+    monkeypatch.setattr(
+        mp_connector.DenseOffloadScheduler,
+        "build_connector_meta",
+        lambda _self: metadata,
+    )
+
+    assert scheduler.build_connector_meta() is metadata
+
+    # The worker owns only [2, 8). The scheduler releases both ranges that
+    # will not be consumed by the retrieve.
+    assert [(call["start"], call["end"]) for call in adapter.freed] == [
+        (0, 2),
+        (8, 12),
+    ]
+
+
+def test_mp_lookup_rejects_retrieve_beyond_lookup_hit(monkeypatch):
+    monkeypatch.setattr(mp_connector.time, "sleep", lambda _seconds: None)
+    adapter = _LookupAdapter([8])
+    client = mp_connector._MPLookupClient(
+        adapter,
+        timeout=10.0,
+        poll_interval=0.01,
+    )
+
+    assert client.lookup(list(range(12)), "req") == 8
+    with pytest.raises(ValueError, match="retrieve end 12 exceeds lookup hit 8"):
+        client.prepare_retrieve("req", 0, 12)
+
+    assert adapter.freed == []
+    assert client.hit_tokens("req") == 8
 
 
 def test_mp_lookup_timeout_defers_cleanup_until_result(monkeypatch):
@@ -640,7 +702,7 @@ def test_worker_future_query_exception_preserves_inflight_transfers(
     assert output.finished_saving == {save_operation}
 
 
-def test_worker_unhealthy_drains_pending_for_same_block_recompute(
+def test_worker_unhealthy_preserves_pending_until_device_futures_are_terminal(
     fake_lmcache_modules,
 ):
     adapter = _WorkerAdapter()
@@ -672,6 +734,62 @@ def test_worker_unhealthy_drains_pending_for_same_block_recompute(
     output = worker.get_finished()
 
     assert output.finished_loading == set()
+    assert output.failed_loading == set()
+    assert output.finished_saving == set()
+    assert set(worker._pending_loads) == {"load:12:1"}
+    assert set(worker._pending_saves) == {"save:13:1"}
+
+    _finish_load(worker, "load:12:1", result=False)
+    _finish_save(worker, "save:13:1", result=False)
+    output = worker.get_finished()
+
+    assert output.failed_loading == {load_operation}
+    assert output.finished_saving == {save_operation}
+    assert worker._pending_loads == {}
+    assert worker._pending_saves == {}
+
+
+def test_worker_pre_submit_drops_are_immediately_terminal(
+    fake_lmcache_modules,
+    monkeypatch,
+):
+    adapter = _WorkerAdapter()
+    monkeypatch.setattr(
+        adapter,
+        "submit_retrieve_request",
+        lambda _request_id, _op, _event: None,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "submit_store_request",
+        lambda _request_id, _op, _event: None,
+    )
+    worker = _worker(adapter)
+    load_operation = LoadOperationId(req_id=14, generation=1)
+    save_operation = SaveOperationId(req_id=15, generation=1)
+    worker._submit_load(
+        LMCacheReqMeta(
+            req_id=14,
+            token_ids=list(range(8)),
+            block_ids=[90, 91],
+            load_spec=LoadSpec(0, 8, can_load=True),
+            load_operation=load_operation,
+        ),
+        object(),
+    )
+    worker._submit_save(
+        LMCacheReqMeta(
+            req_id=15,
+            token_ids=list(range(8)),
+            block_ids=[100, 101],
+            save_spec=SaveSpec(skip_leading_tokens=0),
+            save_operation=save_operation,
+        ),
+        object(),
+    )
+
+    output = worker.get_finished()
+
     assert output.failed_loading == {load_operation}
     assert output.finished_saving == {save_operation}
     assert worker._pending_loads == {}
