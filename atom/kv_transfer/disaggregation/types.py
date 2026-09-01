@@ -142,6 +142,8 @@ class KVTransferTensors:
     plane count explicit so registration can reject a missing plane.
     ``staging_region`` plus ``gather_slot``/``scatter_slot`` cover only the
     compressor-state PD staging pool and are invalid as sidecar SLOT sources.
+    ``index_staging_region`` plus ``gather_sharded_index`` cover producer-side
+    repacking of preshuffled index pages before DCP-sharded RDMA.
     """
 
     # Block-indexed PAGE regions, indexed forward by physical block id.
@@ -163,6 +165,12 @@ class KVTransferTensors:
     scatter_slot: Callable[[int, int], None] | None = None
     # Appended for positional compatibility with existing generic descriptors.
     expected_full_slot_region_count: int | None = None
+    # Producer-side DSA index-page staging. The callback fills one pool slot
+    # with compact destination pages and returns (base_addr, page_count).
+    index_staging_region: KVTransferRegion | None = None
+    index_staging_pool_size: int = 0
+    index_staging_chunk_pages: int = 0
+    gather_sharded_index: Callable[..., tuple[int, int]] | None = None
 
 
 @dataclass
