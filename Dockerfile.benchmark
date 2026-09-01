@@ -1,0 +1,10 @@
+FROM rocm/atom:latest
+
+# The official image carries ATOM's native ROCm/AITER stack. Install the
+# checked-out source and its pinned Python dependencies on top so benchmark
+# runs exercise this repository revision rather than the image's older copy.
+WORKDIR /opt/atom-current
+COPY . /opt/atom-current
+ENV ATOM_MESH_BUILD=0
+RUN python -m pip install --no-cache-dir --editable /opt/atom-current
+
