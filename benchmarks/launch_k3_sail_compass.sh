@@ -5,6 +5,7 @@ variant="${1:?usage: $0 plain|dcp|dspark|dcp-dspark}"
 task_root="${ATOM_ABLATION_ROOT:-/home/sr/work/atom-k3-ablation-20260901}"
 cache_root="${ATOM_HF_CACHE_ROOT:-/home/sr/.cache}"
 image="${ATOM_BENCHMARK_IMAGE:-sailresearchco/atom:k3-ablation-68c8bafb}"
+max_model_len="${ATOM_MAX_MODEL_LEN:-16384}"
 target_snapshot="/root/.cache/huggingface/hub/models--moonshotai--Kimi-K3/snapshots/9f62e4e9fffbd0a83ddd60e1c209d828994b3569"
 draft_snapshot="/root/.cache/huggingface/hub/models--Inferact--Kimi-K3-DSpark/snapshots/cf6b8244620e7ea4b0651d214f28e89eac75bed6"
 container="atom-k3-ablation-atom-${variant}"
@@ -19,7 +20,7 @@ common=(
   --kv_cache_dtype fp8
   -tp 8
   --trust-remote-code
-  --max-model-len 16384
+  --max-model-len "${max_model_len}"
   --max-num-seqs 64
   --max-num-batched-tokens 16384
   --gpu-memory-utilization 0.93
