@@ -1,10 +1,17 @@
 FROM rocm/atom:latest
 
-# The official image carries ATOM's native ROCm/AITER stack. Install the
-# checked-out source and its pinned Python dependencies on top so benchmark
-# runs exercise this repository revision rather than the image's older copy.
+# Current ATOM CI replaces the release image's bundled AITER with the
+# latest-main gfx942/gfx950 wheel. Keep the downloaded wheel in the build
+# context so the exact artifact and checksum can be recorded with a run.
+COPY aiter-whl/amd_aiter-*.whl /tmp/
+RUN python -m pip uninstall --yes amd-aiter || true && \
+    rm -rf /app/aiter-test && \
+    python -m pip install --no-cache-dir /tmp/amd_aiter-*.whl && \
+    rm -f /tmp/amd_aiter-*.whl
+
+# Install the checked-out source and its pinned Python dependencies on top so
+# benchmark runs exercise this repository revision rather than the image copy.
 WORKDIR /opt/atom-current
 COPY . /opt/atom-current
 ENV ATOM_MESH_BUILD=0
 RUN python -m pip install --no-cache-dir --editable /opt/atom-current
-

@@ -4,10 +4,10 @@ set -euo pipefail
 variant="${1:?usage: $0 plain|dcp|dspark|dcp-dspark}"
 task_root="${ATOM_ABLATION_ROOT:-/home/sr/work/atom-k3-ablation-20260901}"
 cache_root="${ATOM_HF_CACHE_ROOT:-/home/sr/.cache}"
-image="${ATOM_BENCHMARK_IMAGE:-sailresearchco/atom:k3-ablation-68c8bafb}"
+image="${ATOM_BENCHMARK_IMAGE:-sailresearchco/atom:k3-ablation-68c8bafb-aiter-d58537b}"
 max_model_len="${ATOM_MAX_MODEL_LEN:-16384}"
-target_snapshot="/root/.cache/huggingface/hub/models--moonshotai--Kimi-K3/snapshots/9f62e4e9fffbd0a83ddd60e1c209d828994b3569"
-draft_snapshot="/root/.cache/huggingface/hub/models--Inferact--Kimi-K3-DSpark/snapshots/cf6b8244620e7ea4b0651d214f28e89eac75bed6"
+target_snapshot="/root/.cache/huggingface/models--moonshotai--Kimi-K3/snapshots/9f62e4e9fffbd0a83ddd60e1c209d828994b3569-materialized"
+draft_snapshot="Inferact/Kimi-K3-DSpark"
 container="atom-k3-ablation-atom-${variant}"
 
 quant_config='{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}'
@@ -68,6 +68,8 @@ sudo docker run -d \
   --shm-size 128g \
   --device /dev/kfd \
   --device /dev/dri \
+  -e HF_HUB_OFFLINE=1 \
+  -e TRANSFORMERS_OFFLINE=1 \
   -v "${cache_root}:/root/.cache" \
   "${image}" \
   python -m atom.entrypoints.openai_server \
