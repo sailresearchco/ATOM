@@ -34,14 +34,10 @@ rank-local retrieve failures visible.
 the `atom.kv_transfer.offload.mp.glm52` implementation for
 `model_type == "glm_moe_dsa"`.
 
-ATOM's Docker images pin the v0.5.5rc1 ROCm wheel and its immutable release
-commit. They retain the wheel's matching Python and storage-extension payload,
-then rebuild `lmcache_native` and the HIP `cuda_ops` extension against the
-image's PyTorch ABI. The dedicated ROCm 7.2.4 / torch 2.10 release artifact
-introduced by [LMCache#4683](https://github.com/LMCache/LMCache/pull/4683) was
-not published for v0.5.5rc1, so the rebuild remains necessary for this pin.
-Do not substitute the wheel's bundled `cuda_ops` into an ATOM image with a
-different PyTorch ABI.
+ATOM's Docker images pin the official v0.5.5rc2 ROCm 7.2.4 / torch 2.10 wheel
+published by [LMCache#4683](https://github.com/LMCache/LMCache/pull/4683).
+The wheel contains `lmcache_native` and HIP `cuda_ops` built for the image's
+exact PyTorch ABI, so the image installs it directly without rebuilding LMCache.
 
 The connector uses a layout-specific model namespace, so its objects cannot be
 mixed with objects written by vLLM's connector or ATOM's legacy connector.
