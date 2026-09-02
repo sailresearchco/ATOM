@@ -2387,6 +2387,30 @@ async def get_cache_stats():
         ) from e
 
 
+@app.post("/reset_prefix_cache")
+async def reset_prefix_cache():
+    """Clear reusable prefix/state indexes after all requests have drained."""
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine is not initialized")
+    try:
+        result = engine.reset_prefix_cache()
+    except TimeoutError as e:
+        logger.exception("Timed out resetting prefix cache")
+        raise HTTPException(status_code=504, detail=str(e)) from e
+    except Exception as e:
+        logger.exception("Failed to reset prefix cache")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to reset prefix cache: {e}"
+        ) from e
+    status_code = {
+        "success": 200,
+        "busy": 409,
+        "unsupported": 409,
+        "failed": 500,
+    }.get(result.get("status"), 500)
+    return JSONResponse(status_code=status_code, content=result)
+
+
 def _resolve_kv_transfer_role(kv_cfg: dict) -> tuple[str | None, int]:
     kv_role = kv_cfg.get("kv_role")
     handshake_port = kv_cfg.get("handshake_port", 6301)
