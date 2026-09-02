@@ -85,6 +85,10 @@ esac
 
 mkdir -p "${task_root}/logs" "${task_root}/manifests"
 sudo docker rm -f "${container}" >/dev/null 2>&1 || true
+if ss -H -ltn 'sport = :31000' | grep -q .; then
+  echo "port 31000 is already in use before launching ${container}" >&2
+  exit 1
+fi
 sudo docker run -d \
   --name "${container}" \
   --privileged \

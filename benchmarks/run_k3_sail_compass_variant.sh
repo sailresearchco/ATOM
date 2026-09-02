@@ -16,17 +16,22 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 ready=0
 for _ in $(seq 1 90); do
-  if curl --fail --silent --show-error \
-    http://127.0.0.1:31000/health >/dev/null 2>&1 && \
-    curl --fail --silent --show-error \
-      http://127.0.0.1:31000/v1/models >/dev/null 2>&1; then
-    ready=1
-    break
-  fi
   if ! sudo docker inspect --format '{{.State.Running}}' "${container}" \
     2>/dev/null | grep -qx true; then
     sudo docker logs --tail 200 "${container}" >&2 || true
     exit 1
+  fi
+  if curl --fail --silent --show-error \
+    http://127.0.0.1:31000/health >/dev/null 2>&1 && \
+    curl --fail --silent --show-error \
+      http://127.0.0.1:31000/v1/models \
+      | jq -e '.data | any(.id == "moonshotai/Kimi-K3")' >/dev/null; then
+    sleep 2
+    if sudo docker inspect --format '{{.State.Running}}' "${container}" \
+      2>/dev/null | grep -qx true; then
+      ready=1
+      break
+    fi
   fi
   sleep 10
 done
