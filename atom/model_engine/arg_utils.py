@@ -64,6 +64,7 @@ class EngineArgs:
     throughput_log_interval: float = 10.0
     cache_hit_rate_window: int = 1000
     scheduler_delay_factor: float = 0.0
+    num_continuous_decode_steps: int = 1
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
     cudagraph_capture_sizes: str = "[1,2,4,8,16,32,48,64,128,256]"
@@ -504,6 +505,16 @@ class EngineArgs:
             default=0.0,
             help="Apply a delay (of delay factor multiplied by previous"
             "prompt latency) before scheduling next prompt.",
+        )
+        parser.add_argument(
+            "--num-continuous-decode-steps",
+            type=int,
+            default=1,
+            help=(
+                "Run this many decode-only engine steps before polling for new "
+                "requests or admitting another prefill. Values above 1 are "
+                "currently supported only for monolithic DP1/PP1 serving."
+            ),
         )
         parser.add_argument(
             "--mark-trace",

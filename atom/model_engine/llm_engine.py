@@ -61,6 +61,7 @@ class LLMEngine:
                 config.parallel_config.data_parallel_master_port = (
                     data_parallel_master_port
                 )
+        config.validate_continuous_decode_topology()
         self.data_parallel_size = config.parallel_config.data_parallel_size
         # PCP and DP-attention are not yet compatible: PCP stripe-splits
         # input_ids to 1/pcp_size in ForCausalLM.forward, but DP-attention's

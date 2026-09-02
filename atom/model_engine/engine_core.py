@@ -110,6 +110,10 @@ class EngineCore:
         self.input_thread.start()
 
         self.mark_trace = getattr(config, "mark_trace", False)
+        self.num_continuous_decode_steps = config.num_continuous_decode_steps
+        self._last_step_was_decode_only = False
+        self._continuous_decode_bursts = 0
+        self._continuous_decode_extra_steps = 0
         init_exit_handler(self)
         self._init_data_parallel(config)
 
@@ -171,6 +175,15 @@ class EngineCore:
                 config,
                 state_runtime=self.state_runtime,
             )
+            # DP1 uses one scheduler for every TP/DCP worker, so the prefill
+            # delayer runs locally without a process group. Pipeline stages
+            # have independent schedulers and need coordinated admission
+            # before this can be enabled for PP.
+            if (
+                config.parallel_config.data_parallel_size == 1
+                and config.pipeline_parallel_size == 1
+            ):
+                self._maybe_attach_prefill_delayer(config, cpu_group=None)
 
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
         self._next_idle_kv_drain = 0.0
@@ -191,6 +204,31 @@ class EngineCore:
 
         self._send_ready_signal()
         logger.info(f"{self.label}: EngineCore fully initialized and ready")
+
+    def _maybe_attach_prefill_delayer(self, config: Config, cpu_group) -> None:
+        """Attach the shared prefill policy after this core owns a Scheduler."""
+        if self.scheduler is None or not envs.ATOM_ENABLE_PREFILL_DELAYER:
+            return
+
+        from atom.model_engine.prefill_delayer import PrefillDelayer
+
+        self.scheduler.set_prefill_delayer(
+            PrefillDelayer(
+                dp_size=config.parallel_config.data_parallel_size,
+                cpu_group=cpu_group,
+                max_num_batched_tokens=config.max_num_batched_tokens,
+                target_fill=envs.ATOM_PREFILL_DELAYER_TARGET_FILL,
+                ttft_max_ticks=envs.ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS,
+                partial_max_ticks=envs.ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS,
+                stall_ticks=envs.ATOM_PREFILL_DELAYER_STALL_TICKS,
+                kv_high_watermark=envs.ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK,
+                token_usage_low_watermark=(
+                    envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK
+                ),
+                max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
+                prefill_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL,
+            )
+        )
 
     def _freeze_after_startup(self):
         """Freeze this process and its ModelRunner workers.
@@ -325,7 +363,8 @@ class EngineCore:
                 if self._is_idle_rl_weights_offloaded():
                     continue
                 if not self.scheduler.is_finished():
-                    self._process_engine_step()
+                    if self._process_engine_step():
+                        self._run_continuous_decode_steps(next_metrics_push)
                 elif self.has_pending_kv_work():
                     self._advance_idle_kv_transfer()
         finally:
@@ -339,9 +378,10 @@ class EngineCore:
                 logger.exception("KV event publish during shutdown failed")
             self.scheduler.shutdown_kv_events()
 
-    def _process_engine_step(self):
+    def _process_engine_step(self, *, decode_only: bool = False):
+        """Run exactly one complete scheduler/forward/postprocess step."""
         try:
-            return self._process_engine_step_inner()
+            return self._process_engine_step_inner(decode_only=decode_only)
         finally:
             # Swallow publisher errors so they cannot mask an exception from
             # the engine step itself.
@@ -350,8 +390,54 @@ class EngineCore:
             except Exception:
                 logger.exception("KV event publish in engine-step finally failed")
 
-    def _process_engine_step_inner(self):
-        result = self.scheduler.schedule()
+    def _run_continuous_decode_steps(self, next_metrics_push: float) -> int:
+        """Run bounded decode-only follow-ups, yielding promptly to control work.
+
+        Each follow-up uses the complete engine-step wrapper. This is required
+        for speculative state, KDA metadata, streamed outputs, and KV events to
+        advance exactly once per model forward.
+        """
+        extra_steps = 0
+        while (
+            extra_steps < self.num_continuous_decode_steps - 1
+            and self._last_step_was_decode_only
+            and not self._should_interrupt_continuous_decode(next_metrics_push)
+        ):
+            if not self._process_engine_step(decode_only=True):
+                break
+            extra_steps += 1
+        if extra_steps:
+            self._continuous_decode_bursts += 1
+            self._continuous_decode_extra_steps += extra_steps
+            if self._continuous_decode_bursts == 1 or (
+                self._continuous_decode_bursts % 1000 == 0
+            ):
+                effective_steps = 1.0 + (
+                    self._continuous_decode_extra_steps / self._continuous_decode_bursts
+                )
+                logger.info(
+                    "%s continuous decode: configured=%d bursts=%d "
+                    "extra_steps=%d effective_steps_per_burst=%.2f",
+                    self.label,
+                    self.num_continuous_decode_steps,
+                    self._continuous_decode_bursts,
+                    self._continuous_decode_extra_steps,
+                    effective_steps,
+                )
+        return extra_steps
+
+    def _should_interrupt_continuous_decode(self, next_metrics_push: float) -> bool:
+        """Keep request/control latency bounded to one in-flight forward."""
+        return (
+            not self.input_queue.empty()
+            or self._has_pending_utility
+            or time.monotonic() >= next_metrics_push
+            or self.scheduler.is_finished()
+        )
+
+    def _process_engine_step_inner(self, *, decode_only: bool = False):
+        self._last_step_was_decode_only = False
+        result = self.scheduler.schedule(decode_only=decode_only)
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
         # the scheduler) through the same finished-seq path as normal seqs.
@@ -370,6 +456,11 @@ class EngineCore:
             logger.debug("%s: No sequences to schedule, skipping forward", self.label)
             self._advance_idle_kv_transfer()
             return False
+
+        self._last_step_was_decode_only = (
+            scheduled_batch.total_seqs_num_prefill == 0
+            and scheduled_batch.total_seqs_num_decode > 0
+        )
 
         # Dispatch KV connector metadata to workers (triggers async KV load)
         if (
@@ -643,24 +734,7 @@ class DPEngineCoreProc(EngineCore):
         self.engines_running = True
         self._shutting_down = False
 
-        if envs.ATOM_ENABLE_PREFILL_DELAYER:
-            from atom.model_engine.prefill_delayer import PrefillDelayer
-
-            self.scheduler.set_prefill_delayer(
-                PrefillDelayer(
-                    dp_size=config.parallel_config.data_parallel_size,
-                    cpu_group=self.dp_group,
-                    max_num_batched_tokens=config.max_num_batched_tokens,
-                    target_fill=envs.ATOM_PREFILL_DELAYER_TARGET_FILL,
-                    ttft_max_ticks=envs.ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS,
-                    partial_max_ticks=envs.ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS,
-                    stall_ticks=envs.ATOM_PREFILL_DELAYER_STALL_TICKS,
-                    kv_high_watermark=envs.ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK,
-                    token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
-                    max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
-                    prefill_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL,
-                )
-            )
+        self._maybe_attach_prefill_delayer(config, cpu_group=self.dp_group)
 
     def _init_data_parallel(self, config: Config):
         dp_rank = config.parallel_config.data_parallel_rank

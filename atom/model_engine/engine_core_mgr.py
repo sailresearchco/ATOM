@@ -300,6 +300,10 @@ class CoreManager:
             ), "Pipeline parallel combined with data parallel is not supported yet."
             local_engine_count = len(rank_assignments) * pp_size
 
+        # DP-attention rewrites TP ranks into independent engine/DP ranks above;
+        # validate the final topology rather than only the user-facing input.
+        config.validate_continuous_decode_topology()
+
         global_engine_count = (
             config.parallel_config.data_parallel_size * pp_size
             if not config.enable_dp_attention
