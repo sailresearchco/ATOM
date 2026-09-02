@@ -143,11 +143,21 @@ def main():
     parser.add_argument(
         "--rounds", type=int, default=3, help="Number of rounds to repeat"
     )
+    parser.add_argument(
+        "--prefix-repeat",
+        type=int,
+        default=1,
+        help="Repeat the shared prefix this many times (useful for cache checkpoints)",
+    )
     parser.add_argument("--base-url", type=str, default=BASE_URL)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
+    if args.prefix_repeat < 1:
+        parser.error("--prefix-repeat must be at least 1")
+
     base_url = args.base_url
+    shared_prefix = MATH_PREFIX * args.prefix_repeat
 
     # Health check
     try:
@@ -163,16 +173,18 @@ def main():
     print(f"Model: {model}")
     print(f"Questions per round: {len(TEST_QUESTIONS)}")
     print(f"Rounds: {args.rounds}")
-    print(f"Shared prefix length: ~{len(MATH_PREFIX)} chars")
+    print(f"Shared prefix repeat: {args.prefix_repeat}")
+    print(f"Shared prefix length: ~{len(shared_prefix)} chars")
     print()
 
     all_round_results = []
+    round_answers = []
 
     for round_num in range(1, args.rounds + 1):
         t0 = time.time()
         correct, total, results = run_batch(
             TEST_QUESTIONS,
-            MATH_PREFIX,
+            shared_prefix,
             base_url=base_url,
             model=model,
             label=f"Round {round_num}",
@@ -180,6 +192,7 @@ def main():
         elapsed = time.time() - t0
         accuracy = 100.0 * correct / total
         all_round_results.append((correct, total, accuracy, elapsed))
+        round_answers.append([result[2] for result in results])
 
         print(
             f"Round {round_num}: {correct}/{total} correct ({accuracy:.1f}%) in {elapsed:.1f}s"
@@ -199,9 +212,13 @@ def main():
     total_correct = sum(r[0] for r in all_round_results)
     total_questions = sum(r[1] for r in all_round_results)
     overall_accuracy = 100.0 * total_correct / total_questions
+    answers_consistent = all(
+        answers == round_answers[0] for answers in round_answers[1:]
+    )
 
     # Check consistency: same questions should give same answers across rounds
     print(f"Overall: {total_correct}/{total_questions} ({overall_accuracy:.1f}%)")
+    print(f"Answers consistent across rounds: {answers_consistent}")
     for i, (c, t, a, e) in enumerate(all_round_results, 1):
         cache_note = "(cold)" if i == 1 else "(cache warm)"
         print(f"  Round {i}: {c}/{t} ({a:.1f}%) {e:.1f}s {cache_note}")
@@ -214,11 +231,17 @@ def main():
         print(f"\n  Speedup round 2 vs round 1: {speedup:.2f}x")
 
     # Pass/fail
-    if overall_accuracy >= 80.0:
-        print(f"\nPASS: accuracy {overall_accuracy:.1f}% >= 80%")
+    if overall_accuracy == 100.0 and answers_consistent:
+        print(
+            f"\nPASS: accuracy {overall_accuracy:.1f}% == 100% "
+            "and answers are consistent"
+        )
         return 0
     else:
-        print(f"\nFAIL: accuracy {overall_accuracy:.1f}% < 80%")
+        print(
+            f"\nFAIL: accuracy={overall_accuracy:.1f}% "
+            f"answers_consistent={answers_consistent}"
+        )
         return 1
 
 
