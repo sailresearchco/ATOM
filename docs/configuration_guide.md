@@ -31,6 +31,7 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `trust_remote_code` | `bool` | `False` | Trust remote code when loading the model from HuggingFace |
 | `max_num_batched_tokens` | `int` | `16384` | Maximum number of tokens batched together per scheduler step |
 | `scheduler_delay_factor` | `float` | `0.0` | Multiplicative delay (factor x previous prompt latency) before scheduling the next prompt |
+| `num_continuous_decode_steps` | `int` | `1` | Maximum consecutive decode-only engine steps before returning to the request/control loop. Values above 1 currently require monolithic DP1/PP1 serving; DCP remains supported because it does not create additional engine schedulers. |
 | `max_num_seqs` | `int` | `512` | Maximum number of sequences batched together |
 | `max_model_len` | `int \| None` | `None` | Maximum context length; defaults to `hf_config.max_position_embeddings` (capped by it when set) |
 | `gpu_memory_utilization` | `float` | `0.9` | Fraction of GPU memory available for KV cache and weights (0.0 — 1.0) |
@@ -63,6 +64,15 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `bos_token_id` | `int` | `-1` | Beginning-of-sequence token ID (`-1` = use model default) |
 | `eos_token_id` | `int` | `-1` | End-of-sequence token ID (`-1` = use model default) |
 | `stop_token_ids` | `list[int]` | `[]` | Additional stop token IDs; populated from `GenerationConfig.eos_token_id` during init |
+
+Set this through `--num-continuous-decode-steps N`. The value is a ceiling, not
+a guaranteed group size: ATOM yields after the current forward when a request
+or utility command arrives, metrics are due, or decode work finishes. When the
+prefill delayer holds an eligible prefill, the hold may include one bounded
+continuous-decode group; when it releases a prefill, that prefill step does not
+start a decode group. Each grouped step still performs a full schedule, model
+forward, postprocess, streaming-output drain, and KV-event publication. This
+preserves speculative-decoding and per-request cache state.
 
 **Auto-derived fields** (set in `__post_init__` or by `ModelRunner.get_num_blocks()`, not user-supplied):
 

@@ -62,6 +62,7 @@ class LLMEngine:
                 config.parallel_config.data_parallel_master_port = (
                     data_parallel_master_port
                 )
+        config.validate_continuous_decode_topology()
         self.data_parallel_size = config.parallel_config.data_parallel_size
         # TBO's two concurrent ubatches are supported by the mori EP
         # dispatch/combine path. The EP collective fallback instead issues

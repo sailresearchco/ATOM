@@ -14,19 +14,22 @@ This document describes the environment variables used in the ATOM project.
 | **ATOM_DP_LB_REQ_EQUIV** | int | 512 | Token-equivalent decode pressure assigned to each in-flight request by `least_tokens` routing. |
 | **ATOM_DP_SESSION_AFFINITY** | bool | false | Load-place each new session, then keep later turns on the same prefix-cache owner. Reads `X-Dynamo-Session-ID`, falling back to `X-Correlation-ID`. |
 
-## Prefill delayer (DP attention)
+## Prefill delayer
 
-Prefill **coalescer** for DP-attention + EP-MoE serving. Holds back prefill
-admission until the accumulated prefill (fresh waiting tokens + resumable
-partials' remaining tokens) fills a worthwhile forward, so fragmented
-short-input prefills / small partial tail chunks batch into one forward instead
-of firing many tiny ones. Releases when the fill target is reached, when a
-must-fire bound trips (no decode to hide behind, KV pressure/starvation, TTFT
-deadline, partial deadline), or when the queue stops growing. Preserves
-cross-rank phase alignment (releases only when every rank is prefill-ready,
-unless a bound forces it). All timing is tick-based (deterministic across ranks —
-no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only when
-`data_parallel_size > 1`.
+Prefill **coalescer** for monolithic serving and DP-attention + EP-MoE serving.
+Holds back prefill admission until the accumulated prefill (fresh waiting
+tokens + resumable partials' remaining tokens) fills a worthwhile forward, so
+fragmented short-input prefills / small partial tail chunks batch into one
+forward instead of firing many tiny ones. Releases when the fill target is
+reached, when a must-fire bound trips (no decode to hide behind, KV
+pressure/starvation, TTFT deadline, partial deadline), or when the queue stops
+growing. Preserves cross-rank phase alignment (releases only when every rank is
+prefill-ready, unless a bound forces it). All timing is tick-based
+(deterministic across ranks — no wall-clock skew). See
+`atom/model_engine/prefill_delayer.py`. With `data_parallel_size == 1` and
+pipeline parallelism disabled, the same policy runs locally without a process
+group; cross-rank alignment is then vacuous and the policy only coalesces
+prefill work and protects decode passes.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
