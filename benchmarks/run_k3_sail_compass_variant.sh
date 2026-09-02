@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-variant="${1:?usage: $0 plain|dcp|dspark|dspark-N|dcp-dspark CONFIG EMIT_RUN_INFO}"
+variant="${1:?usage: $0 plain|dcp|dspark|dspark-N|dcp-dspark|dcp-dspark-N CONFIG EMIT_RUN_INFO}"
 config="${2:?usage: $0 VARIANT CONFIG EMIT_RUN_INFO}"
 emit_run_info="${3:?usage: $0 VARIANT CONFIG EMIT_RUN_INFO}"
 

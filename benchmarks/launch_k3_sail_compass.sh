@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-variant="${1:?usage: $0 plain|dcp|dspark|dspark-N|dcp-dspark}"
+variant="${1:?usage: $0 plain|dcp|dspark|dspark-N|dcp-dspark|dcp-dspark-N}"
 task_root="${ATOM_ABLATION_ROOT:-/home/sr/work/atom-k3-ablation-20260901}"
 cache_root="${ATOM_HF_CACHE_ROOT:-/home/sr/.cache}"
 image="${ATOM_BENCHMARK_IMAGE:-sailresearchco/atom:k3-ablation-68c8bafb-aiter-d58537b}"
@@ -62,6 +62,19 @@ case "${variant}" in
       --draft-model "${draft_snapshot}"
       --method dspark
       --num-speculative-tokens 2
+    )
+    ;;
+  dcp-dspark-*)
+    dspark_tokens="${variant#dcp-dspark-}"
+    if ! [[ "${dspark_tokens}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "invalid DCP+DSpark proposal depth: ${dspark_tokens}" >&2
+      exit 2
+    fi
+    delta=(
+      -dcp 8
+      --draft-model "${draft_snapshot}"
+      --method dspark
+      --num-speculative-tokens "${dspark_tokens}"
     )
     ;;
   *)
