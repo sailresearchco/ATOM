@@ -1670,6 +1670,27 @@ class BlockManager:
         if self._event_log is not None:
             self._event_log.append(_make_all_cleared())
 
+    def cache_index_counts(self) -> dict[str, int]:
+        """Return the content indexes affected by :meth:`clear_cache`.
+
+        Pending paged-state checkpoints are reported separately: an idle
+        scheduler should have none, and exposing them makes an incomplete
+        reset observable instead of folding it into the ready index count.
+        """
+        if self.paged_state_checkpoints is None:
+            state_indexed = len(self.state.hash_to_slot)
+            state_pending = 0
+        else:
+            coordinator = self.paged_state_checkpoints
+            store = coordinator.store
+            state_indexed = len(store.hash_to_checkpoint)
+            state_pending = len(coordinator._pending) + len(store._pending_by_hash)
+        return {
+            "prefix_blocks_indexed": self.kv.num_indexed,
+            "state_checkpoints_indexed": state_indexed,
+            "state_checkpoints_pending": state_pending,
+        }
+
     @property
     def kv_events_enabled(self) -> bool:
         """True iff KV events are being recorded."""

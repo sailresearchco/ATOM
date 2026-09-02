@@ -45,6 +45,8 @@ class EngineUtilityHandler:
         "get_mtp_stats": "_handle_get_mtp_stats",
         "get_mtp_statistics": "_handle_get_mtp_statistics",
         "get_cache_statistics": "_handle_get_cache_statistics",
+        "inspect_prefix_cache": "_handle_inspect_prefix_cache",
+        "reset_prefix_cache": "_handle_reset_prefix_cache",
         "abort_request": "_handle_abort_request",
     }
 
@@ -319,6 +321,47 @@ class EngineUtilityHandler:
             result |= self.scheduler.block_manager.checkpoint_funnel()
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "get_cache_statistics", "result": result})
+        )
+
+    def _prefix_cache_snapshot(self) -> dict:
+        scheduler = self.scheduler
+        block_manager = getattr(scheduler, "block_manager", None)
+        running, waiting = (
+            scheduler.get_request_counts() if scheduler is not None else (0, 0)
+        )
+        stats = getattr(scheduler, "engine_stats", None)
+        result = {
+            "engine_index": int(getattr(stats, "engine_index", 0)),
+            "role": getattr(scheduler, "_METRICS_ROLE", ""),
+            "supported": block_manager is not None,
+            "running_requests": int(running),
+            "waiting_requests": int(waiting),
+        }
+        if block_manager is not None:
+            result.update(block_manager.cache_index_counts())
+        return result
+
+    def _handle_inspect_prefix_cache(self, args: dict):
+        """Return an idle/count preflight without mutating cache state."""
+        self.output_queue.put_nowait(
+            (
+                "UTILITY_RESPONSE",
+                {"cmd": "inspect_prefix_cache", "result": self._prefix_cache_snapshot()},
+            )
+        )
+
+    def _handle_reset_prefix_cache(self, args: dict):
+        """Clear prefix/state indexes only while this scheduler is drained."""
+        before = self._prefix_cache_snapshot()
+        block_manager = getattr(self.scheduler, "block_manager", None)
+        busy = before["running_requests"] or before["waiting_requests"]
+        cleared = bool(block_manager is not None and not busy)
+        if cleared:
+            block_manager.clear_cache()
+        after = self._prefix_cache_snapshot()
+        result = {"cleared": cleared, "before": before, "after": after}
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "reset_prefix_cache", "result": result})
         )
 
     def push_metrics(self) -> None:

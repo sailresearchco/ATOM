@@ -436,6 +436,62 @@ class LLMEngine:
             ),
         }
 
+    def reset_prefix_cache(self, timeout: float = 30.0) -> dict[str, Any]:
+        """Synchronously clear prefix/state indexes on every idle engine.
+
+        The inspect phase prevents a partially-drained DP deployment from
+        clearing only its idle ranks. Each engine rechecks immediately before
+        mutation as a final guard.
+        """
+
+        def results(responses):
+            return [response.get("result", response) for response in responses]
+
+        before = results(
+            self.core_mgr.broadcast_utility_command_sync(
+                "inspect_prefix_cache", timeout=timeout
+            )
+        )
+        supported = [snapshot for snapshot in before if snapshot.get("supported")]
+        busy = [
+            snapshot
+            for snapshot in before
+            if snapshot.get("running_requests", 0)
+            or snapshot.get("waiting_requests", 0)
+        ]
+        if busy:
+            return {"status": "busy", "cleared": False, "engines": before}
+        if not supported:
+            return {"status": "unsupported", "cleared": False, "engines": before}
+
+        reset = results(
+            self.core_mgr.broadcast_utility_command_sync(
+                "reset_prefix_cache", timeout=timeout
+            )
+        )
+        failed = []
+        became_busy = False
+        for result in reset:
+            reset_before = result.get("before", {})
+            after = result.get("after", {})
+            if reset_before.get("running_requests", 0) or reset_before.get(
+                "waiting_requests", 0
+            ):
+                became_busy = True
+            if reset_before.get("supported") and (
+                not result.get("cleared")
+                or after.get("prefix_blocks_indexed", 0)
+                or after.get("state_checkpoints_indexed", 0)
+                or after.get("state_checkpoints_pending", 0)
+            ):
+                failed.append(result)
+        status = "busy" if became_busy else "failed" if failed else "success"
+        return {
+            "status": status,
+            "cleared": not failed and not became_busy,
+            "engines": reset,
+        }
+
     def get_metrics_statistics(self) -> dict[str, Any]:
         """Return a DP-aggregated snapshot for the Prometheus exporter.
 
