@@ -27,6 +27,9 @@ services:
       ATOM_PREFILL_DECODE_INTERVAL: ${ATOM_PREFILL_DECODE_INTERVAL:-0}
     volumes:
       - ${ATOM_HF_CACHE_ROOT:-/home/sr/.cache}:/root/.cache:ro
+      # Torch/ATOM compile artifacts must be writable and should survive a
+      # container replacement. A nested bind overrides only this subtree.
+      - ${ATOM_RUNTIME_CACHE_ROOT:-/home/sr/.cache/atom-runtime}:/root/.cache/atom
     command:
       - python
       - -m

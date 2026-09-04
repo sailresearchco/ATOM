@@ -39,9 +39,12 @@ metrics, verifies an idle cache reset on every engine, and writes the resolved
 container/image configuration to `manifests/`.
 
 The target and draft snapshots must already exist beneath
-`ATOM_HF_CACHE_ROOT`. The cache is mounted read-only and both Hugging Face
+`ATOM_HF_CACHE_ROOT`. The model cache is mounted read-only and both Hugging Face
 offline modes are forced, preventing a replica from silently fetching or
-changing model artifacts during rollout.
+changing model artifacts during rollout. `ATOM_RUNTIME_CACHE_ROOT` is a
+separate writable persistent mount for ATOM/Torch compile artifacts; keeping it
+separate preserves model immutability without forcing every restart to compile
+from scratch.
 
 ## Rollout boundary
 

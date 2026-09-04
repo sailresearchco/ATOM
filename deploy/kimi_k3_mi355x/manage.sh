@@ -36,6 +36,7 @@ validate_host() {
   require_env
   : "${ATOM_IMAGE:?ATOM_IMAGE must be set}"
   "${docker_cmd[@]}" image inspect "${ATOM_IMAGE}" >/dev/null
+  mkdir -p "${ATOM_RUNTIME_CACHE_ROOT:-/home/sr/.cache/atom-runtime}"
   if [[ ! -e /dev/kfd ]]; then
     echo "/dev/kfd is missing" >&2
     exit 1
