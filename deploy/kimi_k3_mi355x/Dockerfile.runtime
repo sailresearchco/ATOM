@@ -1,0 +1,18 @@
+ARG ATOM_BASE_IMAGE=sailresearchco/atom@sha256:5e406e193929971848a9d49cabf95d7231f6f92b7892b9d3612ca0d01fa643cb
+FROM ${ATOM_BASE_IMAGE}
+
+ARG ATOM_SOURCE_COMMIT=unknown
+ARG ATOM_SOURCE_VERSION=0.0+unknown
+LABEL org.opencontainers.image.source="https://github.com/sailresearchco/ATOM" \
+      org.opencontainers.image.revision="${ATOM_SOURCE_COMMIT}" \
+      ai.sail.atom.source-version="${ATOM_SOURCE_VERSION}" \
+      ai.sail.atom.profile="kimi-k3-mi355x-tp8-dcp8-dspark4"
+
+# The benchmark image already contains the validated gfx950 AITER wheel. Bake
+# the Sail fork into the runtime image so deploys never depend on a host bind
+# mount or on whatever source happened to be present in the base image.
+WORKDIR /opt/atom-current
+COPY . /opt/atom-current
+ENV ATOM_MESH_BUILD=0 \
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ATOM=${ATOM_SOURCE_VERSION}
+RUN python -m pip install --no-cache-dir --no-deps --editable /opt/atom-current
