@@ -263,6 +263,9 @@ class CoreManager:
         # from EngineCore's own periodic push. Read directly by the exporter, so
         # scraping costs no round trip and cannot time out.
         self.latest_metrics: dict[int, dict] = {}
+        # Independent 4 Hz snapshots for /v1/loads; unlike metrics, these are
+        # deliberately tiny and fresh enough for admission headroom decisions.
+        self.latest_loads: dict[int, dict] = {}
 
     def __init__(self, config: Config):
         pp_size = config.pipeline_parallel_size
@@ -656,6 +659,8 @@ class CoreManager:
                                 )
                     elif request_type == EngineCoreRequestType.METRICS:
                         self.latest_metrics[dp_rank] = data
+                    elif request_type == EngineCoreRequestType.LOADS:
+                        self.latest_loads[dp_rank] = data
                     elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
                         self.utility_response_queue.put_nowait(data)
                     elif request_type == EngineCoreRequestType.ADD:

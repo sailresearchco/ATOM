@@ -48,6 +48,10 @@ logger = logging.getLogger("atom")
 # server's scrape interval: the exporter reads a cache, so this bounds how
 # stale a Prometheus sample can be.
 METRICS_PUSH_INTERVAL_S = 5.0
+# Sail admission polls /v1/loads at 4 Hz. This lightweight snapshot is separate
+# from the full metrics export, so admission freshness does not multiply the
+# Prometheus payload/aggregation work.
+LOADS_PUSH_INTERVAL_S = 0.25
 
 # Pace of the idle KV drain. The busy loops never block, so an unpaced drain
 # would fire one worker RPC round per spin; 1ms matches the PP head's existing
@@ -349,6 +353,7 @@ class EngineCore:
     def busy_loop(self):
         shutdown = False
         next_metrics_push = 0.0
+        next_loads_push = 0.0
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
@@ -356,6 +361,9 @@ class EngineCore:
                 if now >= next_metrics_push:
                     next_metrics_push = now + METRICS_PUSH_INTERVAL_S
                     self.utility_handler.push_metrics()
+                if now >= next_loads_push:
+                    next_loads_push = now + LOADS_PUSH_INTERVAL_S
+                    self.utility_handler.push_loads()
                 self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
@@ -364,7 +372,9 @@ class EngineCore:
                     continue
                 if not self.scheduler.is_finished():
                     if self._process_engine_step():
-                        self._run_continuous_decode_steps(next_metrics_push)
+                        self._run_continuous_decode_steps(
+                            min(next_metrics_push, next_loads_push)
+                        )
                 elif self.has_pending_kv_work():
                     self._advance_idle_kv_transfer()
         finally:
@@ -390,7 +400,7 @@ class EngineCore:
             except Exception:
                 logger.exception("KV event publish in engine-step finally failed")
 
-    def _run_continuous_decode_steps(self, next_metrics_push: float) -> int:
+    def _run_continuous_decode_steps(self, next_control_push: float) -> int:
         """Run bounded decode-only follow-ups, yielding promptly to control work.
 
         Each follow-up uses the complete engine-step wrapper. This is required
@@ -401,7 +411,7 @@ class EngineCore:
         while (
             extra_steps < self.num_continuous_decode_steps - 1
             and self._last_step_was_decode_only
-            and not self._should_interrupt_continuous_decode(next_metrics_push)
+            and not self._should_interrupt_continuous_decode(next_control_push)
         ):
             if not self._process_engine_step(decode_only=True):
                 break
@@ -426,12 +436,12 @@ class EngineCore:
                 )
         return extra_steps
 
-    def _should_interrupt_continuous_decode(self, next_metrics_push: float) -> bool:
+    def _should_interrupt_continuous_decode(self, next_control_push: float) -> bool:
         """Keep request/control latency bounded to one in-flight forward."""
         return (
             not self.input_queue.empty()
             or self._has_pending_utility
-            or time.monotonic() >= next_metrics_push
+            or time.monotonic() >= next_control_push
             or self.scheduler.is_finished()
         )
 
@@ -473,6 +483,8 @@ class EngineCore:
 
         # Run the model forward pass if there are actual sequences
         has_seqs = len(scheduled_batch.req_ids) > 0
+        prefill_tokens = int(scheduled_batch.total_tokens_num_prefill)
+        prefill_started_ns = time.perf_counter_ns() if prefill_tokens > 0 else None
         if has_seqs:
             self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
             fwd_out = self.runner_mgr.call_func(
@@ -502,6 +514,11 @@ class EngineCore:
             stream_output_queue=self.stream_output_queue,
             batch=scheduled_batch,
         )
+        if prefill_started_ns is not None:
+            self.scheduler.record_prefill_work(
+                prefill_tokens,
+                (time.perf_counter_ns() - prefill_started_ns) // 1000,
+            )
 
         # Send stream outputs to main process via output_queue
         try:
@@ -697,6 +714,11 @@ class EngineCore:
                     socket.send(obj)
                     continue
 
+                if isinstance(item, tuple) and item[0] == "LOADS":
+                    obj = pickle.dumps((EngineCoreRequestType.LOADS, item[1]))
+                    socket.send(obj)
+                    continue
+
                 if isinstance(item, tuple) and item[0] == "UTILITY_RESPONSE":
                     # Send utility command response back to CoreManager
                     response_data = item[1]
@@ -767,6 +789,7 @@ class DPEngineCoreProc(EngineCore):
     def busy_loop(self):
         shutdown = False
         next_metrics_push = 0.0
+        next_loads_push = 0.0
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
@@ -774,6 +797,9 @@ class DPEngineCoreProc(EngineCore):
                 if now >= next_metrics_push:
                     next_metrics_push = now + METRICS_PUSH_INTERVAL_S
                     self.utility_handler.push_metrics()
+                if now >= next_loads_push:
+                    next_loads_push = now + LOADS_PUSH_INTERVAL_S
+                    self.utility_handler.push_loads()
                 self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 local_unfinished = (
@@ -1070,6 +1096,9 @@ class PrefillEngineCore(EngineCore):
             "prefill_forward", scheduled_batch, wait_out=True
         )
         iter_ms = (time.perf_counter() - t0) * 1000
+        self.scheduler.record_prefill_work(
+            int(scheduled_batch.total_tokens_num_prefill), int(iter_ms * 1000)
+        )
         logger.info(
             f"prefill iter {iter_ms:.2f}ms | "
             f"reqs={scheduled_batch.total_seqs_num} | "
