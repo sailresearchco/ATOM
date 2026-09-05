@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
+from atom.model_engine.load_snapshot import build_sglang_loads
 from atom.model_engine.multimodal import build_multimodal_inputs
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
@@ -2348,6 +2349,22 @@ async def list_models():
 async def health():
     """Health check endpoint."""
     return {"status": "ok"}
+
+
+@app.get("/v1/loads")
+async def loads(include: str | None = None):
+    """SGLang-compatible engine load used by Sail's admission proxy."""
+    del include  # accepted for compatibility with ``?include=core``
+    if engine is None:
+        raise HTTPException(status_code=503, detail="engine is not initialized")
+    try:
+        return build_sglang_loads(
+            config=engine.config,
+            max_pool_tokens=engine.core_mgr.max_pool_tokens,
+            rank_stats=dict(engine.core_mgr.latest_loads),
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.api_route("/metrics", methods=["GET", "HEAD"], include_in_schema=False)

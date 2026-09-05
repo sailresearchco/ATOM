@@ -3,6 +3,7 @@
 
 import logging
 import queue
+import time
 from typing import ClassVar
 
 from atom.model_engine.sequence import SequenceStatus
@@ -377,6 +378,38 @@ class EngineUtilityHandler:
         the last off-loop writer on the control socket.
         """
         self.output_queue.put_nowait(("METRICS", self.collect_metrics()))
+
+    def push_loads(self) -> None:
+        """Publish the small, high-cadence snapshot used by /v1/loads."""
+        scheduler = self.scheduler
+        if scheduler is None:
+            result = {"enabled": False}
+        else:
+            running, waiting = scheduler.get_request_counts()
+            block_manager = getattr(scheduler, "block_manager", None)
+            kv_pool = None if block_manager is None else block_manager.kv
+            result = {
+                "enabled": True,
+                # Engine-process wall clock at collection time. The API must
+                # forward this unchanged so consumers can reject a stale push.
+                "timestamp": time.time(),
+                "requests_running": running,
+                "requests_waiting": waiting,
+                "waiting_uncached_tokens": scheduler.waiting_uncached_tokens(),
+                "total_prefill_uncached_tokens": int(
+                    getattr(scheduler, "total_prefill_uncached_tokens", 0)
+                ),
+                "total_prefill_busy_us": int(
+                    getattr(scheduler, "total_prefill_busy_us", 0)
+                ),
+            }
+            if kv_pool is not None:
+                result |= {
+                    "kv_blocks_used": kv_pool.num_used,
+                    "kv_blocks_free": kv_pool.num_free,
+                    "kv_blocks_total": kv_pool.num_blocks,
+                }
+        self.output_queue.put_nowait(("LOADS", result))
 
     def collect_metrics(self) -> dict:
         """One rank's scheduler, KV, MTP, and cache metrics."""
