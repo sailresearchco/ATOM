@@ -497,6 +497,11 @@ class Scheduler:
         # Dashboard counters update only at request lifecycle boundaries.
         self.total_prompt_tokens = 0
         self.total_generation_tokens = 0
+        # Cumulative, monotonic counters consumed by /v1/loads. Prompt tokens
+        # are credited when their actual (post-prefix-cache) prefill batch runs;
+        # wall time covers that forward and is never synthesized into a rate.
+        self.total_prefill_uncached_tokens = 0
+        self.total_prefill_busy_us = 0
         self.total_finished_requests = 0
         self.total_preemptions = 0
         self.profile_active = False
@@ -665,6 +670,26 @@ class Scheduler:
             num_waiting_reqs=num_waiting_reqs,
             kv_usage=self._kv_usage(),
         )
+
+    def record_prefill_work(self, tokens: int, busy_us: int) -> None:
+        """Record one completed forward containing genuine prefill work."""
+        if tokens <= 0:
+            return
+        self.total_prefill_uncached_tokens += int(tokens)
+        self.total_prefill_busy_us += max(int(busy_us), 0)
+
+    def waiting_uncached_tokens(self) -> int:
+        """Current not-yet-prefilled prompt work, in global token units."""
+        total = sum(
+            max(int(seq.num_prompt_tokens) - int(seq.num_cached_tokens), 0)
+            for seq in self.waiting
+        )
+        total += sum(
+            max(int(seq.num_prompt_tokens) - int(seq.num_cached_tokens), 0)
+            for seq in self.running
+            if seq.is_partial_prefill
+        )
+        return total
 
     def heartbeat_throughput(self, now: float) -> None:
         """Close the throughput window on time while the engine sits idle."""
@@ -959,7 +984,9 @@ class Scheduler:
         self._rejected = []
         return out
 
-    def schedule(self) -> tuple[ScheduledBatch, dict[int, Sequence]] | None:
+    def schedule(
+        self, *, decode_only: bool = False
+    ) -> tuple[ScheduledBatch, dict[int, Sequence]] | None:
         """Run a scheduling pass and close the throughput window.
 
         **Override `_schedule`, not this.** The window's 10s cadence is a
@@ -970,11 +997,16 @@ class Scheduler:
         as long as it fires, and nothing would fail — the log would just go
         quiet, which is indistinguishable from an idle engine.
         """
-        result = self._schedule()
+        # Keep the ordinary call shape compatible with specialized schedulers
+        # that override `_schedule()` (for example disaggregated decode). Only
+        # the monolithic Scheduler receives the new decode-only mode.
+        result = self._schedule(decode_only=True) if decode_only else self._schedule()
         self._record_throughput(num_prompt_tokens=_prompt_tokens_of(result))
         return result
 
-    def _schedule(self) -> tuple[ScheduledBatch, dict[int, Sequence]] | None:
+    def _schedule(
+        self, *, decode_only: bool = False
+    ) -> tuple[ScheduledBatch, dict[int, Sequence]] | None:
         """Select the next batch of sequences for a forward pass.
 
         Tries prefill first; if no new prefills are ready, falls back to
@@ -996,7 +1028,12 @@ class Scheduler:
 
         # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
         # every tick on every rank for lockstep — hence before the early-return.
-        if self.prefill_delayer is not None:
+        if decode_only:
+            # A continuous-decode follow-up deliberately leaves fresh and
+            # partial prefills queued until the outer engine loop polls input
+            # and resumes normal scheduling.
+            delayer_allows = False
+        elif self.prefill_delayer is not None:
             # pending = fresh waiting new-tokens + resumable partials' remaining,
             # capped at the batch budget: the coalescer's accumulation signal.
             pending_tokens = min(
@@ -2771,6 +2808,8 @@ class PrefillScheduler:
         )
         self.total_prompt_tokens = 0
         self.total_generation_tokens = 0
+        self.total_prefill_uncached_tokens = 0
+        self.total_prefill_busy_us = 0
         self.total_finished_requests = 0
         self.total_preemptions = 0
 
@@ -2898,6 +2937,18 @@ class PrefillScheduler:
             num_running_reqs=num_running_reqs,
             num_waiting_reqs=num_waiting_reqs,
             kv_usage=None,
+        )
+
+    def record_prefill_work(self, tokens: int, busy_us: int) -> None:
+        if tokens <= 0:
+            return
+        self.total_prefill_uncached_tokens += int(tokens)
+        self.total_prefill_busy_us += max(int(busy_us), 0)
+
+    def waiting_uncached_tokens(self) -> int:
+        return sum(
+            max(int(seq.num_prompt_tokens) - int(seq.num_cached_tokens), 0)
+            for seq in (*self.waiting, *self.running)
         )
 
     def heartbeat_throughput(self, now: float) -> None:

@@ -1524,6 +1524,7 @@ class Config:
     # `BlockManager._record_checkpoint_demand` for the placement.
     state_checkpoint_demand: bool = True
     scheduler_delay_factor: float = 0.0
+    num_continuous_decode_steps: int = 1
     max_num_seqs: int = 512
     max_model_len: int | None = None
     gpu_memory_utilization: float = 0.9
@@ -1673,7 +1674,22 @@ class Config:
             return [1, 2, 4, 8] + list(range(16, sizes[0] + 1, 16))
         return list(sizes)
 
+    def validate_continuous_decode_topology(self) -> None:
+        """Validate after every mutation of the effective engine topology."""
+        if self.num_continuous_decode_steps < 1:
+            raise ValueError("num_continuous_decode_steps must be at least 1")
+        if self.num_continuous_decode_steps > 1 and (
+            self.parallel_config.data_parallel_size != 1
+            or self.pipeline_parallel_size != 1
+            or self.enable_rapidserve
+        ):
+            raise ValueError(
+                "num_continuous_decode_steps > 1 currently requires monolithic "
+                "DP1/PP1 serving"
+            )
+
     def __post_init__(self):
+        self.validate_continuous_decode_topology()
         self.moe_backend = self.moe_backend.strip().lower()
         if self.moe_backend not in ("standard", "mega"):
             raise ValueError(

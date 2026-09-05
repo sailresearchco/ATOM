@@ -58,3 +58,6 @@ online_quant_info_*.json
 # CI: Docker / BuildKit state under workspace (self-hosted CI)
 .atom-docker-client/
 .buildkit-tmp/
+
+# Local CI-resolved AITER wheels used by Dockerfile.benchmark.
+aiter-whl/

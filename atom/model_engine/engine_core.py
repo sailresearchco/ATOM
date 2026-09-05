@@ -48,6 +48,10 @@ logger = logging.getLogger("atom")
 # server's scrape interval: the exporter reads a cache, so this bounds how
 # stale a Prometheus sample can be.
 METRICS_PUSH_INTERVAL_S = 5.0
+# Sail admission polls /v1/loads at 4 Hz. This lightweight snapshot is separate
+# from the full metrics export, so admission freshness does not multiply the
+# Prometheus payload/aggregation work.
+LOADS_PUSH_INTERVAL_S = 0.25
 
 # Pace of the idle KV drain. The busy loops never block, so an unpaced drain
 # would fire one worker RPC round per spin; 1ms matches the PP head's existing
@@ -110,6 +114,10 @@ class EngineCore:
         self.input_thread.start()
 
         self.mark_trace = getattr(config, "mark_trace", False)
+        self.num_continuous_decode_steps = config.num_continuous_decode_steps
+        self._last_step_was_decode_only = False
+        self._continuous_decode_bursts = 0
+        self._continuous_decode_extra_steps = 0
         init_exit_handler(self)
         self._init_data_parallel(config)
 
@@ -171,6 +179,15 @@ class EngineCore:
                 config,
                 state_runtime=self.state_runtime,
             )
+            # DP1 uses one scheduler for every TP/DCP worker, so the prefill
+            # delayer runs locally without a process group. Pipeline stages
+            # have independent schedulers and need coordinated admission
+            # before this can be enabled for PP.
+            if (
+                config.parallel_config.data_parallel_size == 1
+                and config.pipeline_parallel_size == 1
+            ):
+                self._maybe_attach_prefill_delayer(config, cpu_group=None)
 
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
         self._next_idle_kv_drain = 0.0
@@ -191,6 +208,31 @@ class EngineCore:
 
         self._send_ready_signal()
         logger.info(f"{self.label}: EngineCore fully initialized and ready")
+
+    def _maybe_attach_prefill_delayer(self, config: Config, cpu_group) -> None:
+        """Attach the shared prefill policy after this core owns a Scheduler."""
+        if self.scheduler is None or not envs.ATOM_ENABLE_PREFILL_DELAYER:
+            return
+
+        from atom.model_engine.prefill_delayer import PrefillDelayer
+
+        self.scheduler.set_prefill_delayer(
+            PrefillDelayer(
+                dp_size=config.parallel_config.data_parallel_size,
+                cpu_group=cpu_group,
+                max_num_batched_tokens=config.max_num_batched_tokens,
+                target_fill=envs.ATOM_PREFILL_DELAYER_TARGET_FILL,
+                ttft_max_ticks=envs.ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS,
+                partial_max_ticks=envs.ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS,
+                stall_ticks=envs.ATOM_PREFILL_DELAYER_STALL_TICKS,
+                kv_high_watermark=envs.ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK,
+                token_usage_low_watermark=(
+                    envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK
+                ),
+                max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
+                prefill_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL,
+            )
+        )
 
     def _freeze_after_startup(self):
         """Freeze this process and its ModelRunner workers.
@@ -311,6 +353,7 @@ class EngineCore:
     def busy_loop(self):
         shutdown = False
         next_metrics_push = 0.0
+        next_loads_push = 0.0
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
@@ -318,6 +361,9 @@ class EngineCore:
                 if now >= next_metrics_push:
                     next_metrics_push = now + METRICS_PUSH_INTERVAL_S
                     self.utility_handler.push_metrics()
+                if now >= next_loads_push:
+                    next_loads_push = now + LOADS_PUSH_INTERVAL_S
+                    self.utility_handler.push_loads()
                 self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
@@ -325,7 +371,10 @@ class EngineCore:
                 if self._is_idle_rl_weights_offloaded():
                     continue
                 if not self.scheduler.is_finished():
-                    self._process_engine_step()
+                    if self._process_engine_step():
+                        self._run_continuous_decode_steps(
+                            min(next_metrics_push, next_loads_push)
+                        )
                 elif self.has_pending_kv_work():
                     self._advance_idle_kv_transfer()
         finally:
@@ -339,9 +388,10 @@ class EngineCore:
                 logger.exception("KV event publish during shutdown failed")
             self.scheduler.shutdown_kv_events()
 
-    def _process_engine_step(self):
+    def _process_engine_step(self, *, decode_only: bool = False):
+        """Run exactly one complete scheduler/forward/postprocess step."""
         try:
-            return self._process_engine_step_inner()
+            return self._process_engine_step_inner(decode_only=decode_only)
         finally:
             # Swallow publisher errors so they cannot mask an exception from
             # the engine step itself.
@@ -350,8 +400,54 @@ class EngineCore:
             except Exception:
                 logger.exception("KV event publish in engine-step finally failed")
 
-    def _process_engine_step_inner(self):
-        result = self.scheduler.schedule()
+    def _run_continuous_decode_steps(self, next_control_push: float) -> int:
+        """Run bounded decode-only follow-ups, yielding promptly to control work.
+
+        Each follow-up uses the complete engine-step wrapper. This is required
+        for speculative state, KDA metadata, streamed outputs, and KV events to
+        advance exactly once per model forward.
+        """
+        extra_steps = 0
+        while (
+            extra_steps < self.num_continuous_decode_steps - 1
+            and self._last_step_was_decode_only
+            and not self._should_interrupt_continuous_decode(next_control_push)
+        ):
+            if not self._process_engine_step(decode_only=True):
+                break
+            extra_steps += 1
+        if extra_steps:
+            self._continuous_decode_bursts += 1
+            self._continuous_decode_extra_steps += extra_steps
+            if self._continuous_decode_bursts == 1 or (
+                self._continuous_decode_bursts % 1000 == 0
+            ):
+                effective_steps = 1.0 + (
+                    self._continuous_decode_extra_steps / self._continuous_decode_bursts
+                )
+                logger.info(
+                    "%s continuous decode: configured=%d bursts=%d "
+                    "extra_steps=%d effective_steps_per_burst=%.2f",
+                    self.label,
+                    self.num_continuous_decode_steps,
+                    self._continuous_decode_bursts,
+                    self._continuous_decode_extra_steps,
+                    effective_steps,
+                )
+        return extra_steps
+
+    def _should_interrupt_continuous_decode(self, next_control_push: float) -> bool:
+        """Keep request/control latency bounded to one in-flight forward."""
+        return (
+            not self.input_queue.empty()
+            or self._has_pending_utility
+            or time.monotonic() >= next_control_push
+            or self.scheduler.is_finished()
+        )
+
+    def _process_engine_step_inner(self, *, decode_only: bool = False):
+        self._last_step_was_decode_only = False
+        result = self.scheduler.schedule(decode_only=decode_only)
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
         # the scheduler) through the same finished-seq path as normal seqs.
@@ -371,6 +467,11 @@ class EngineCore:
             self._advance_idle_kv_transfer()
             return False
 
+        self._last_step_was_decode_only = (
+            scheduled_batch.total_seqs_num_prefill == 0
+            and scheduled_batch.total_seqs_num_decode > 0
+        )
+
         # Dispatch KV connector metadata to workers (triggers async KV load)
         if (
             self.kv_transfer_enabled
@@ -382,6 +483,8 @@ class EngineCore:
 
         # Run the model forward pass if there are actual sequences
         has_seqs = len(scheduled_batch.req_ids) > 0
+        prefill_tokens = int(scheduled_batch.total_tokens_num_prefill)
+        prefill_started_ns = time.perf_counter_ns() if prefill_tokens > 0 else None
         if has_seqs:
             self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
             fwd_out = self.runner_mgr.call_func(
@@ -411,6 +514,11 @@ class EngineCore:
             stream_output_queue=self.stream_output_queue,
             batch=scheduled_batch,
         )
+        if prefill_started_ns is not None:
+            self.scheduler.record_prefill_work(
+                prefill_tokens,
+                (time.perf_counter_ns() - prefill_started_ns) // 1000,
+            )
 
         # Send stream outputs to main process via output_queue
         try:
@@ -606,6 +714,11 @@ class EngineCore:
                     socket.send(obj)
                     continue
 
+                if isinstance(item, tuple) and item[0] == "LOADS":
+                    obj = pickle.dumps((EngineCoreRequestType.LOADS, item[1]))
+                    socket.send(obj)
+                    continue
+
                 if isinstance(item, tuple) and item[0] == "UTILITY_RESPONSE":
                     # Send utility command response back to CoreManager
                     response_data = item[1]
@@ -643,24 +756,7 @@ class DPEngineCoreProc(EngineCore):
         self.engines_running = True
         self._shutting_down = False
 
-        if envs.ATOM_ENABLE_PREFILL_DELAYER:
-            from atom.model_engine.prefill_delayer import PrefillDelayer
-
-            self.scheduler.set_prefill_delayer(
-                PrefillDelayer(
-                    dp_size=config.parallel_config.data_parallel_size,
-                    cpu_group=self.dp_group,
-                    max_num_batched_tokens=config.max_num_batched_tokens,
-                    target_fill=envs.ATOM_PREFILL_DELAYER_TARGET_FILL,
-                    ttft_max_ticks=envs.ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS,
-                    partial_max_ticks=envs.ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS,
-                    stall_ticks=envs.ATOM_PREFILL_DELAYER_STALL_TICKS,
-                    kv_high_watermark=envs.ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK,
-                    token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
-                    max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
-                    prefill_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL,
-                )
-            )
+        self._maybe_attach_prefill_delayer(config, cpu_group=self.dp_group)
 
     def _init_data_parallel(self, config: Config):
         dp_rank = config.parallel_config.data_parallel_rank
@@ -693,6 +789,7 @@ class DPEngineCoreProc(EngineCore):
     def busy_loop(self):
         shutdown = False
         next_metrics_push = 0.0
+        next_loads_push = 0.0
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
@@ -700,6 +797,9 @@ class DPEngineCoreProc(EngineCore):
                 if now >= next_metrics_push:
                     next_metrics_push = now + METRICS_PUSH_INTERVAL_S
                     self.utility_handler.push_metrics()
+                if now >= next_loads_push:
+                    next_loads_push = now + LOADS_PUSH_INTERVAL_S
+                    self.utility_handler.push_loads()
                 self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 local_unfinished = (
@@ -996,6 +1096,9 @@ class PrefillEngineCore(EngineCore):
             "prefill_forward", scheduled_batch, wait_out=True
         )
         iter_ms = (time.perf_counter() - t0) * 1000
+        self.scheduler.record_prefill_work(
+            int(scheduled_batch.total_tokens_num_prefill), int(iter_ms * 1000)
+        )
         logger.info(
             f"prefill iter {iter_ms:.2f}ms | "
             f"reqs={scheduled_batch.total_seqs_num} | "
