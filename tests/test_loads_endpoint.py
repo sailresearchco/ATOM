@@ -85,6 +85,38 @@ def test_stale_engine_snapshot_is_not_retimestamped_by_api():
         )
 
 
+def test_scheduler_queue_includes_waiting_and_partial_prefill_only():
+    from atom.model_engine.scheduler import Scheduler
+
+    def seq(prompt, cached, partial=False):
+        return SimpleNamespace(
+            num_prompt_tokens=prompt,
+            num_cached_tokens=cached,
+            is_partial_prefill=partial,
+        )
+
+    scheduler = SimpleNamespace(
+        # A newly arrived prefix hit is conservatively full-sized until the
+        # scheduler probes the cache and updates num_cached_tokens.
+        waiting=[seq(100, 0), seq(100, 64)],
+        running=[seq(200, 128, True), seq(300, 0, False)],
+    )
+    assert Scheduler.waiting_uncached_tokens(scheduler) == 208
+
+
+def test_prefill_counters_are_monotonic_and_ignore_non_prefill_steps():
+    from atom.model_engine.scheduler import Scheduler
+
+    scheduler = SimpleNamespace(
+        total_prefill_uncached_tokens=10,
+        total_prefill_busy_us=20,
+    )
+    Scheduler.record_prefill_work(scheduler, 128, 1_000)
+    Scheduler.record_prefill_work(scheduler, 0, 2_000)
+    assert scheduler.total_prefill_uncached_tokens == 138
+    assert scheduler.total_prefill_busy_us == 1_020
+
+
 def test_http_route_returns_compatible_payload(monkeypatch):
     from atom.entrypoints.openai import api_server
 
