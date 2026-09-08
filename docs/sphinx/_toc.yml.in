@@ -43,6 +43,8 @@ subtrees:
         title: Compilation and CUDA graphs
       - file: serving_benchmarking_guide
         title: Serving and benchmarking
+      - file: kimi-k3-atom-vs-sglang
+        title: Kimi-K3 ATOM vs SGLang ablation
 
   - caption: Framework integrations
     entries:
