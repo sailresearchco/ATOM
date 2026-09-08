@@ -33,3 +33,5 @@ class EngineCoreRequestType(enum.Enum):
     UTILITY_RESPONSE = b"\x08"
     # Unsolicited metrics snapshot, pushed by EngineCore on its own clock.
     METRICS = b"\x09"
+    # Lightweight admission snapshot, pushed independently at Skiff cadence.
+    LOADS = b"\x0a"

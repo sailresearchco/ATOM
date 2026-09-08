@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
+from atom.model_engine.load_snapshot import build_sglang_loads
 from atom.model_engine.multimodal import build_multimodal_inputs
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
@@ -2350,6 +2351,22 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/v1/loads")
+async def loads(include: str | None = None):
+    """SGLang-compatible engine load used by Sail's admission proxy."""
+    del include  # accepted for compatibility with ``?include=core``
+    if engine is None:
+        raise HTTPException(status_code=503, detail="engine is not initialized")
+    try:
+        return build_sglang_loads(
+            config=engine.config,
+            max_pool_tokens=engine.core_mgr.max_pool_tokens,
+            rank_stats=dict(engine.core_mgr.latest_loads),
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @app.api_route("/metrics", methods=["GET", "HEAD"], include_in_schema=False)
 async def metrics():
     """Expose cached standalone-engine metrics in Prometheus text format."""
@@ -2385,6 +2402,30 @@ async def get_cache_stats():
         raise HTTPException(
             status_code=500, detail=f"Failed to get cache statistics: {e}"
         ) from e
+
+
+@app.post("/reset_prefix_cache")
+async def reset_prefix_cache():
+    """Clear reusable prefix/state indexes after all requests have drained."""
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine is not initialized")
+    try:
+        result = engine.reset_prefix_cache()
+    except TimeoutError as e:
+        logger.exception("Timed out resetting prefix cache")
+        raise HTTPException(status_code=504, detail=str(e)) from e
+    except Exception as e:
+        logger.exception("Failed to reset prefix cache")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to reset prefix cache: {e}"
+        ) from e
+    status_code = {
+        "success": 200,
+        "busy": 409,
+        "unsupported": 409,
+        "failed": 500,
+    }.get(result.get("status"), 500)
+    return JSONResponse(status_code=status_code, content=result)
 
 
 def _resolve_kv_transfer_role(kv_cfg: dict) -> tuple[str | None, int]:
