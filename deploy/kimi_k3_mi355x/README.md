@@ -6,7 +6,8 @@ selected by the K3 trace ablation:
 - TP8, DCP8, EP1, DSpark proposal depth 4
 - 8,192-token chunked-prefill budget and 32 running sequences
 - 4 continuous decode steps, FP8 KV cache, prefix caching enabled
-- 16,384-token context and 85% GPU-memory target
+- 1,048,576-token configured context and 85% GPU-memory target (the production
+  trace ablation did not exercise the full context window)
 - prefill delayer available but explicitly disabled to match the current MiTAC
   SGLang scheduling policy
 

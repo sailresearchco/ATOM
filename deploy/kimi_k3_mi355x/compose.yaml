@@ -52,7 +52,7 @@ services:
       - "8"
       - --trust-remote-code
       - --max-model-len
-      - ${ATOM_MAX_MODEL_LEN:-16384}
+      - ${ATOM_MAX_MODEL_LEN:-1048576}
       - --max-num-seqs
       - ${ATOM_MAX_NUM_SEQS:-32}
       - --max-num-batched-tokens
