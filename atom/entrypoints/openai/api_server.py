@@ -75,6 +75,7 @@ from .reasoning import (
     thinking_switched_off,
 )
 from .reasoning_dialects import resolve_dialect
+from .request_identity import resolve_request_id
 from .serving_anthropic import (
     AnthropicBlocks,
     AnthropicMessagesRequest,
@@ -1657,7 +1658,9 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             n=effective_n,
         )
 
-        request_id = f"chatcmpl-{uuid.uuid4().hex}"
+        request_id = resolve_request_id(
+            request.rid, raw_request.headers.get("x-request-id"), "chatcmpl"
+        )
         dp_session_id, dp_parent_session_id = _get_dp_session_affinity_ids(raw_request)
         dp_routing = {
             "data_parallel_rank": request.data_parallel_rank,
@@ -1889,7 +1892,9 @@ async def completions(request: CompletionRequest, raw_request: Request):
             n=effective_n,
         )
 
-        request_id = f"cmpl-{uuid.uuid4().hex}"
+        request_id = resolve_request_id(
+            request.rid, raw_request.headers.get("x-request-id"), "cmpl"
+        )
         dp_session_id, dp_parent_session_id = _get_dp_session_affinity_ids(raw_request)
         dp_routing = {
             "data_parallel_rank": request.data_parallel_rank,

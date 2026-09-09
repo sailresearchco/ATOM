@@ -180,6 +180,8 @@ class ChatCompletionRequest(BaseModel):
 
     model_config = {"extra": "ignore"}
 
+    rid: str | None = None
+
     model: str | None = None
     messages: list[ChatMessage] | None = None
     prompt: list[ChatMessage] | None = None  # Accept 'prompt' as alias
@@ -234,6 +236,8 @@ class CompletionRequest(BaseModel):
     """Request model for text completions (OpenAI-compatible)."""
 
     model_config = {"extra": "ignore"}
+
+    rid: str | None = None
 
     model: str | None = None
     prompt: str
