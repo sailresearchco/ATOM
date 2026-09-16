@@ -696,6 +696,7 @@ class ChatCompletionStreamState:
         # reasoning from a bare end marker, because inferring it means waiting
         # for one.
         self.reasoning_filters = [reasoning.stream() for _ in range(n)]
+        self.reasoning_counters = [reasoning.token_counter() for _ in range(n)]
         # `tool_choice="none"` forbids tool calls on this path too, and
         # `tools` is what type-coerces the arguments. The OpenAI server gated
         # and passed both; this one had neither, so the same request answered
@@ -794,6 +795,8 @@ class ChatCompletionStreamState:
         chunks: list[str] = []
         text = event.get("text") or ""
         self.num_tokens_output[index] += len(event.get("token_ids", []))
+        if self.reasoning_counters[index] is not None:
+            self.reasoning_counters[index].update(event.get("token_ids", []))
         if event.get("finish_reason"):
             self.engine_finish_reasons[index] = event["finish_reason"]
 
@@ -900,6 +903,12 @@ class ChatCompletionStreamState:
             "completion_tokens": completion_tokens,
             "total_tokens": self.num_tokens_input + completion_tokens,
         }
+        if self.reasoning_counters and self.reasoning_counters[0] is not None:
+            usage["completion_tokens_details"] = {
+                "reasoning_tokens": sum(
+                    counter.count for counter in self.reasoning_counters
+                )
+            }
         if len(self.num_tokens_output) > 1:
             usage["num_choices"] = len(self.num_tokens_output)
         usage_chunk = {
@@ -1231,6 +1240,9 @@ class AtomStandaloneService:
             or (
                 self.model_starts_in_reasoning
                 and not thinking_switched_off(template_kwargs, self.reasoning_toggle)
+            ),
+            encode_marker=lambda marker: self.tokenizer.encode(
+                marker, add_special_tokens=False
             ),
         )
 

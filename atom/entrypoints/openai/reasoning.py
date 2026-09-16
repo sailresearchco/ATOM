@@ -10,6 +10,7 @@ All model-specific marker knowledge lives in ``reasoning_dialects.DIALECTS``;
 this module contains no per-model conditions. Add a model there, not here.
 """
 
+from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -325,6 +326,7 @@ class ReasoningChannel:
 
     dialect: ReasoningDialect | None = None
     starts_open: bool = False
+    encode_marker: Callable[[str], Sequence[int]] | None = None
 
     def split(self, text: str) -> tuple[str | None, str]:
         """A complete output as ``(reasoning, content)``."""
@@ -333,6 +335,67 @@ class ReasoningChannel:
     def stream(self) -> ReasoningFilter:
         """A filter over the same output arriving in chunks."""
         return ReasoningFilter(starts_thinking=self.starts_open, dialect=self.dialect)
+
+    def token_counter(self):
+        if self.encode_marker is None:
+            return None
+        return ReasoningTokenCounter(self)
+
+    def usage_details(self, token_sequences):
+        if self.encode_marker is None or any(ids is None for ids in token_sequences):
+            return {}
+        count = 0
+        for token_ids in token_sequences:
+            counter = self.token_counter()
+            counter.update(token_ids)
+            count += counter.count
+        return {"completion_tokens_details": {"reasoning_tokens": count}}
+
+
+class ReasoningTokenCounter:
+    # Count generated IDs, including generated boundary markers, never a
+    # re-tokenization of the visible reasoning text. A prompt's opening marker
+    # is input and is therefore excluded. Keep only enough history to recognize
+    # a marker split across speculative steps or merged stream chunks.
+    def __init__(self, channel: ReasoningChannel):
+        dialect = channel.dialect or FALLBACK_DIALECT
+        encode = channel.encode_marker
+        self.opener = (
+            tuple(encode(dialect.output_open_marker))
+            if dialect.output_open_marker
+            else ()
+        )
+        self.ends = tuple(tuple(encode(m)) for m in dialect.end_markers if m)
+        self.framing = tuple(tuple(encode(m)) for m in dialect.content_framing if m)
+        self.tail = deque(
+            maxlen=max(map(len, (self.opener, *self.ends, *self.framing)), default=1)
+        )
+        self.state = 1 if channel.starts_open else 0
+        self.count = 0
+        self.seen = 0
+
+    def update(self, token_ids: Sequence[int]) -> None:
+        for token_id in token_ids:
+            if self.state == 2:
+                return
+            self.seen += 1
+            self.tail.append(token_id)
+            tail = tuple(self.tail)
+            ended = next((m for m in self.ends if m and tail[-len(m) :] == m), None)
+            framing = next(
+                (m for m in self.framing if m and tail[-len(m) :] == m), None
+            )
+            if self.state == 1:
+                self.count += 1
+                if ended:
+                    self.state = 2
+            elif framing:
+                self.seen -= len(framing)
+            elif self.opener and tail[-len(self.opener) :] == self.opener:
+                self.state = 1
+                self.count += len(self.opener)
+            elif ended and self.seen == len(ended):
+                self.state = 2
 
 
 # For a caller with no model behind it -- tests, and the completions endpoint,
