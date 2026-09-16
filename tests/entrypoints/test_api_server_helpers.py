@@ -434,3 +434,89 @@ def test_multimodal_prefill_budget_is_checked_before_dispatch(monkeypatch, size)
             tokens,
             pixels,
         )
+
+
+@pytest.mark.parametrize("failure", ["exception", "timeout", "cancellation"])
+def test_image_warmup_failure_closes_engine_before_readiness(monkeypatch, failure):
+    from unittest.mock import Mock
+
+    from atom.entrypoints.openai import image_warmup
+
+    monkeypatch.setenv("ATOM_IMAGE_WARMUP", "1")
+    engine = SimpleNamespace(close=Mock())
+    monkeypatch.setattr(api_server, "engine", engine)
+    monkeypatch.setattr(api_server, "_metrics_refresh_task", None)
+
+    async def fail(**kwargs):
+        if failure == "timeout":
+            await asyncio.wait_for(asyncio.Event().wait(), timeout=0)
+        if failure == "cancellation":
+            raise asyncio.CancelledError()
+        raise RuntimeError("vision warmup failed")
+
+    monkeypatch.setattr(image_warmup, "warm_image_serving", fail)
+
+    async def startup():
+        async with api_server.lifespan(api_server.app):
+            pytest.fail("Server became ready after a failed warmup")
+
+    error = {
+        "exception": RuntimeError,
+        "timeout": TimeoutError,
+        "cancellation": asyncio.CancelledError,
+    }[failure]
+    with pytest.raises(error):
+        asyncio.run(startup())
+    engine.close.assert_called_once_with()
+    assert api_server._metrics_refresh_task is None
+
+
+@pytest.mark.filterwarnings("ignore:.*found in sys.modules.*:RuntimeWarning")
+def test_image_warmup_uses_state_from_the_running_entrypoint(monkeypatch):
+    import runpy
+
+    # Like `python -m ...api_server`, execute the server in a separate module
+    # namespace. Skip main() so no actual model or GPU is needed for this test.
+    entrypoint = runpy.run_module(
+        "atom.entrypoints.openai.api_server", run_name="__warmup_entrypoint_test__"
+    )
+    monkeypatch.setenv("ATOM_IMAGE_WARMUP", "1")
+    monkeypatch.setattr(api_server, "tokenizer", None)
+    monkeypatch.setattr(api_server, "engine", None)
+    requests = []
+    initialized_tokenizer = SimpleNamespace(
+        encode=lambda *a, **kw: [7], decode=lambda ids: "warm" * len(ids)
+    )
+
+    async def endpoint(payload, request):
+        assert payload.model == "initialized-entrypoint-model"
+        requests.append(payload)
+        return SimpleNamespace(status_code=200)
+
+    async def refresh():
+        pass
+
+    async def refresh_loop():
+        await asyncio.Event().wait()
+
+    # The functions retain the separately executed module's global namespace.
+    state = entrypoint["lifespan"].__wrapped__.__globals__
+    state.update(
+        tokenizer=initialized_tokenizer,
+        model_name="initialized-entrypoint-model",
+        completions=endpoint,
+        chat_completions=endpoint,
+        tune_gc=lambda: None,
+        maybe_attach_gc_debug_callback=lambda *a: None,
+        freeze_gc_heap=lambda *a: None,
+        _refresh_metrics_once=refresh,
+        _metrics_refresh_loop=refresh_loop,
+    )
+
+    async def startup():
+        async with entrypoint["lifespan"](entrypoint["app"]):
+            assert len(requests) == 28
+
+    asyncio.run(startup())
+    assert api_server.tokenizer is None
+    assert api_server.engine is None

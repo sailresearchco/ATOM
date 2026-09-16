@@ -23,6 +23,9 @@ from collections.abc import Callable
 from typing import Any
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Compile representative text and image paths before server readiness.
+    # Opt in only for image-capable models with an 8192-token prefill budget.
+    "ATOM_IMAGE_WARMUP": lambda: os.getenv("ATOM_IMAGE_WARMUP", "0") == "1",
     # --- Data Parallelism ---
     "ATOM_DP_RANK": lambda: int(os.getenv("ATOM_DP_RANK", "0")),
     "ATOM_DP_RANK_LOCAL": lambda: int(os.getenv("ATOM_DP_RANK_LOCAL", "0")),

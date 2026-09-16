@@ -43,6 +43,7 @@ from atom.model_engine.load_snapshot import build_sglang_loads
 from atom.model_engine.multimodal import build_multimodal_inputs
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
+from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
 from atom.utils.gc_utils import (
     freeze_gc_heap,
@@ -1560,15 +1561,26 @@ async def _metrics_refresh_loop() -> None:
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
     global _metrics_refresh_task
-    logger.info("Server started successfully and ready to accept requests")
-    tune_gc()
-    maybe_attach_gc_debug_callback("api_server")
-    await _refresh_metrics_once()
-    _metrics_refresh_task = asyncio.create_task(_metrics_refresh_loop())
-    # The engine was built in `main()`, so this is the last point before the
-    # first request at which everything reachable is still startup state.
-    freeze_gc_heap("api_server")
+    # main() already owns live engine processes. Startup failure must release
+    # them just like normal shutdown, including warmup errors and timeouts.
     try:
+        if envs.ATOM_IMAGE_WARMUP:
+            from .image_warmup import warm_image_serving
+
+            await warm_image_serving(
+                tokenizer=tokenizer,
+                model_name=model_name,
+                completions=completions,
+                chat_completions=chat_completions,
+            )
+        logger.info("Server started successfully and ready to accept requests")
+        tune_gc()
+        maybe_attach_gc_debug_callback("api_server")
+        await _refresh_metrics_once()
+        _metrics_refresh_task = asyncio.create_task(_metrics_refresh_loop())
+        # The engine was built in `main()`, so this is the last point before the
+        # first request at which everything reachable is still startup state.
+        freeze_gc_heap("api_server")
         yield
     finally:
         if _metrics_refresh_task is not None:
