@@ -206,6 +206,7 @@ def reasoning_channel(
     return ReasoningChannel(
         dialect=reasoning_dialect,
         starts_open=prompt_opens or (model_starts_in_reasoning and not switched_off),
+        encode_marker=lambda marker: tokenizer.encode(marker, add_special_tokens=False),
     )
 
 

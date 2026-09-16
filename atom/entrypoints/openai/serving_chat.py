@@ -270,6 +270,7 @@ async def stream_chat_response(
     # the Anthropic path maps to `stop_sequence`, collapsed the same way.
     engine_finish_reason: str | None = None
     reasoning_filter = reasoning.stream()
+    reasoning_counter = reasoning.token_counter()
     tool_parser = ToolCallStreamParser(
         tools=tools,
         parser_cls=_tool_parser_for_request(tool_parser_cls, tools),
@@ -297,6 +298,8 @@ async def stream_chat_response(
             if chunk_data.get("finish_reason"):
                 engine_finish_reason = chunk_data["finish_reason"]
             num_tokens_output += len(chunk_data.get("token_ids", []))
+            if reasoning_counter is not None:
+                reasoning_counter.update(chunk_data.get("token_ids", []))
             _ct = chunk_data.get("num_cached_tokens", 0)
             if _ct:
                 num_cached_tokens = _ct
@@ -368,6 +371,10 @@ async def stream_chat_response(
             "total_tokens": num_tokens_input + num_tokens_output,
             "prompt_tokens_details": {"cached_tokens": num_cached_tokens},
         }
+        if reasoning_counter is not None:
+            usage["completion_tokens_details"] = {
+                "reasoning_tokens": reasoning_counter.count
+            }
         usage_chunk = {
             "id": request_id,
             "object": CHAT_COMPLETION_CHUNK_OBJECT,
@@ -473,6 +480,7 @@ def build_chat_response(
             "ttft_s": round(final_output.get("ttft", 0.0), 4),
             "tpot_s": round(final_output.get("tpot", 0.0), 4),
             "latency_s": round(final_output.get("latency", 0.0), 4),
+            **reasoning.usage_details([final_output.get("token_ids")]),
         },
     )
     if "kv_transfer_output_meta_info" in final_output:
@@ -538,6 +546,7 @@ def build_chat_response_multi(
                 max((out.get("latency", 0.0) for out in final_outputs), default=0.0), 4
             ),
             "num_choices": len(final_outputs),
+            **reasoning.usage_details([out.get("token_ids") for out in final_outputs]),
         },
     )
 
@@ -571,6 +580,7 @@ async def stream_chat_response_fanout(
     num_tokens_output = [0] * n
     # Every sibling answers the same prompt, so they start in the same state.
     reasoning_filters = [reasoning.stream() for _ in range(n)]
+    reasoning_counters = [reasoning.token_counter() for _ in range(n)]
     tool_parsers = [
         ToolCallStreamParser(
             tools=tools,
@@ -611,6 +621,8 @@ async def stream_chat_response_fanout(
             if chunk_data.get("finish_reason"):
                 engine_finish_reasons[idx] = chunk_data["finish_reason"]
             num_tokens_output[idx] += len(chunk_data.get("token_ids", []))
+            if reasoning_counters[idx] is not None:
+                reasoning_counters[idx].update(chunk_data.get("token_ids", []))
             _ct = chunk_data.get("num_cached_tokens", 0)
             if _ct:
                 num_cached_tokens = _ct
@@ -685,6 +697,10 @@ async def stream_chat_response_fanout(
             "num_choices": n,
             "prompt_tokens_details": {"cached_tokens": num_cached_tokens},
         }
+        if reasoning_counters and reasoning_counters[0] is not None:
+            usage["completion_tokens_details"] = {
+                "reasoning_tokens": sum(counter.count for counter in reasoning_counters)
+            }
         usage_chunk = {
             "id": request_id,
             "object": CHAT_COMPLETION_CHUNK_OBJECT,
