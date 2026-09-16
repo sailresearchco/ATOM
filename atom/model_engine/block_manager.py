@@ -486,7 +486,7 @@ class BlockManager:
         # rollback set to.
         if seq.has_per_req_cache and not self.state.has_free(self.state_slots_per_req):
             return -1
-        if not self.enable_prefix_caching:
+        if not self.enable_prefix_caching or seq.has_multimodal_input:
             if not self._has_page_units(self.num_pool_blocks(len(seq))):
                 return -1
             return 0
@@ -719,7 +719,7 @@ class BlockManager:
         `next_forward_tokens` reaches `checkpointers_at`; see there. Left
         unset it reads the prompt's remainder, which is the prefill answer.
         """
-        if not self.enable_prefix_caching:
+        if not self.enable_prefix_caching or seq.has_multimodal_input:
             return
         hbs = self._hash_block_size()
         base = seq.num_cached_tokens if start_tokens is None else start_tokens
@@ -794,7 +794,7 @@ class BlockManager:
         defaults to "no next forward", i.e. hash but never checkpoint, so a
         caller opts into decode-point checkpointing rather than out of it.
         """
-        if not self.enable_prefix_caching:
+        if not self.enable_prefix_caching or seq.has_multimodal_input:
             return
         base = seq.num_hashed_tokens
         if committed_kv_len > base:
@@ -1435,7 +1435,7 @@ class BlockManager:
         into different physical blocks, and replacing the canonical mapping
         would make its eventual eviction remove the wrong cache entry.
         """
-        if not self.enable_prefix_caching:
+        if not self.enable_prefix_caching or seq.has_multimodal_input:
             return 0
 
         start_token = max(0, int(start_token))
@@ -1545,7 +1545,7 @@ class BlockManager:
         hash, so it is neither the total number of hashed prompt blocks nor
         necessarily the number of newly inserted hash-index entries.
         """
-        if not self.enable_prefix_caching:
+        if not self.enable_prefix_caching or seq.has_multimodal_input:
             return 0
 
         hbs = self._hash_block_size()

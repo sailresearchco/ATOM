@@ -111,6 +111,11 @@ class Sequence:
         # allocate() / free it in deallocate().
         self.has_per_req_cache = has_per_req_cache
         self.multimodal_data = multimodal_data
+        # Preserve identity after batch construction consumes multimodal_data.
+        # Token-only cache keys cannot distinguish different image pixels.
+        self.has_multimodal_input = multimodal_data is not None
+        # Recompute the vision prefix if KV is discarded under memory pressure.
+        self.original_multimodal_data = multimodal_data
         self.mrope_positions = mrope_positions
         self.mrope_position_delta = mrope_position_delta
         self.num_tokens = len(self.token_ids)

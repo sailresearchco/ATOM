@@ -896,9 +896,12 @@ class Scheduler:
         # whole prompt), so for them the batched-token budget is a hard cap even
         # when chunked prefill is on.
         is_multimodal = getattr(seq, "multimodal_data", None) is not None
+        # Only the original image prompt is atomic. After preemption, its
+        # already-generated text can be replayed in ordinary prefill chunks.
+        atomic_tokens = seq.num_prompt_tokens if is_multimodal else num_tokens
         if (
             not self.enable_chunked_prefill or is_multimodal
-        ) and num_tokens > self.max_num_batched_tokens:
+        ) and atomic_tokens > self.max_num_batched_tokens:
             remedy = (
                 "Increase --max-num-batched-tokens or shorten the prompt "
                 "(multimodal prompts are never chunked)."
@@ -907,7 +910,7 @@ class Scheduler:
                 "prefill, or shorten the prompt."
             )
             return (
-                f"input tokens={num_tokens} > max_num_batched_tokens="
+                f"input tokens={atomic_tokens} > max_num_batched_tokens="
                 f"{self.max_num_batched_tokens}. {remedy}"
             )
         bm = self.block_manager
@@ -1212,6 +1215,10 @@ class Scheduler:
             # that lands, `max_num_batched_tokens` caps multimodal prompt length
             # even with chunked prefill enabled.
             atomic_prefill = getattr(seq, "multimodal_data", None) is not None
+            if atomic_prefill:
+                # Replay the complete image prompt first, then its generated
+                # text suffix without resending pixels or splitting images.
+                num_new_tokens = seq.num_prompt_tokens
             if (
                 not atomic_prefill
                 and self.enable_chunked_prefill
@@ -1250,6 +1257,13 @@ class Scheduler:
 
             chunk = self._adjust_prefill_chunk_after_alloc(seq, chunk)
             chunk = self._finalize_prefill_chunk(seq, seq.num_cached_tokens, chunk)
+
+            # Allocation can shorten the chunk. Keep the original image prompt
+            # atomic; generated tokens are replayed in subsequent text chunks.
+            if atomic_prefill and chunk < seq.num_prompt_tokens - seq.num_cached_tokens:
+                self.block_manager.deallocate(seq)
+                self.waiting.appendleft(seq)
+                break
 
             self._assert_positive_prefill_chunk(chunk, num_new_tokens, budget_remaining)
             num_seqs_prefill, num_batched_tokens = self._schedule_prefill_seq(
@@ -1303,12 +1317,13 @@ class Scheduler:
             if self.kv_connector is not None:
                 connector_meta_output = self.kv_connector.build_connector_meta()
 
-            # Freeze, per seq, whether this chunk finishes the prompt. Uses the
+            # Freeze whether this chunk finishes prefill, including retained
+            # generated tokens being replayed after preemption. Uses the
             # pre-advance offsets so it is correct whether or not schedule-time
             # advancement runs below.
             is_final_chunk = [
                 (num_cached_tokens_list[i] + int(num_scheduled_tokens[i]))
-                >= seq.num_prompt_tokens
+                >= seq.num_tokens
                 for i, seq in enumerate(scheduled_seqs.values())
             ]
             # Bound on num_tokens (not num_prompt_tokens): preempted seqs
@@ -1888,6 +1903,7 @@ class Scheduler:
             seq.is_partial_prefill = False
             self._partial_prefill_count -= 1
         self.block_manager.deallocate(seq)
+        seq.multimodal_data = seq.original_multimodal_data
         self.waiting.appendleft(seq)
         return True
 
@@ -2044,13 +2060,14 @@ class Scheduler:
                 # multiple steps (hash_blocks clips to fully-filled blocks).
                 self.block_manager.hash_blocks(seq, chunk)
                 seq.num_cached_tokens += chunk
-                # Prefill is partial until the whole PROMPT's KV is computed.
-                # Compare against num_prompt_tokens, not num_tokens: once a
-                # completion token is appended (this step's sampled token, or an
-                # externally-appended EOS), num_tokens > num_prompt_tokens and
-                # comparing against it would wrongly keep a finished prefill
-                # flagged partial — which makes the EOS/finish loop below skip it.
-                now_partial = seq.num_cached_tokens < seq.num_prompt_tokens
+                # Use the scheduled boundary: recomputation includes retained
+                # output tokens, while tokens appended after scheduling must
+                # not turn a final chunk back into a partial one.
+                now_partial = (
+                    not batch.is_final_chunk[i]
+                    if getattr(batch, "is_final_chunk", None) is not None
+                    else seq.num_cached_tokens < seq.num_prompt_tokens
+                )
                 if now_partial != seq.is_partial_prefill:
                     self._partial_prefill_count += 1 if now_partial else -1
                     seq.is_partial_prefill = now_partial
@@ -2096,7 +2113,7 @@ class Scheduler:
             # request from at least one intervening model-runner batch, which
             # already discards its deferred partial output. The first output
             # after the request resumes is fresh and must be kept.
-            if seq.id in prev_partial_ids:
+            if is_deferred_out and seq.id in prev_partial_ids:
                 continue
             # Register prefix-cache hashes for blocks the prefill step just
             # finalized. Deferred from BlockManager.allocate() so a hash is

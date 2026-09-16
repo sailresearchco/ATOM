@@ -400,3 +400,37 @@ class TestARequestIsNotSerialisedForALogNobodyKeeps:
             "_log_request_event is being handed a model_dump() built before "
             f"the guard can decline it: {eager}. Use _log_request_model."
         )
+
+
+def test_multimodal_processor_loads_local_checkpoint_not_served_alias(monkeypatch):
+    paths = []
+    loaded = object()
+    monkeypatch.setattr(api_server, "processor", None)
+    monkeypatch.setattr(api_server, "model_name", "public-alias")
+    monkeypatch.setattr(api_server, "model_path", "/cache/materialized-checkpoint")
+    monkeypatch.setattr(
+        api_server.AutoProcessor,
+        "from_pretrained",
+        lambda path, **kwargs: paths.append(path) or loaded,
+    )
+    assert api_server._get_multimodal_processor() is loaded
+    assert api_server._get_multimodal_processor() is loaded
+    assert paths == ["/cache/materialized-checkpoint"]
+
+
+@pytest.mark.parametrize("size", [8191, 8192, 8193])
+def test_multimodal_prefill_budget_is_checked_before_dispatch(monkeypatch, size):
+    monkeypatch.setattr(
+        api_server,
+        "_get_engine_config",
+        lambda: SimpleNamespace(max_num_batched_tokens=8192),
+    )
+    tokens, pixels = [0] * size, {"pixel_values": object()}
+    if size > 8192:
+        with pytest.raises(ValueError, match="8192.*8193"):
+            api_server._validate_multimodal_prefill(tokens, pixels)
+    else:
+        assert api_server._validate_multimodal_prefill(tokens, pixels) == (
+            tokens,
+            pixels,
+        )
