@@ -152,6 +152,7 @@ reasoning_dialect: Any = None
 reasoning_toggle: tuple[str, Any, Any] | None = None
 processor: Any | None = None
 model_name: str = ""
+model_path: str = ""
 default_chat_template_kwargs: dict[str, Any] = {}
 custom_message_encoder: Any | None = None
 _seq_id_to_request_id: dict[int, str] = {}
@@ -660,10 +661,10 @@ def _load_image_from_url(url: str) -> "Image.Image":
 
 
 def _get_multimodal_processor():
-    global processor, model_name
+    global processor
     if processor is None:
-        logger.info(f"Loading multimodal processor from {model_name}...")
-        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        logger.info(f"Loading multimodal processor from {model_path}...")
+        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
     return processor
 
 
@@ -737,6 +738,18 @@ def _images_before_text(
     return reordered
 
 
+def _validate_multimodal_prefill(token_ids, multimodal_data):
+    # The vision encoder currently requires an atomic prefill. Reject before
+    # dispatch instead of turning the scheduler's rejection into empty success.
+    limit = _get_engine_config().max_num_batched_tokens
+    if len(token_ids) > limit:
+        raise ValueError(
+            f"Image-containing prompts are limited to {limit} input tokens "
+            f"on this worker; received {len(token_ids)}."
+        )
+    return token_ids, multimodal_data
+
+
 def _prepare_multimodal_inputs(
     messages: list[Any],
     chat_template_kwargs: dict[str, Any],
@@ -760,7 +773,7 @@ def _prepare_multimodal_inputs(
         tools=tools,
     )
     if built is not None:
-        return built
+        return _validate_multimodal_prefill(*built)
 
     template_kwargs = dict(chat_template_kwargs)
     template_kwargs.pop("tokenize", None)
@@ -778,7 +791,9 @@ def _prepare_multimodal_inputs(
         "pixel_values": inputs["pixel_values"],
         "image_grid_thw": inputs["image_grid_thw"],
     }
-    return inputs["input_ids"][0].tolist(), multimodal_data
+    return _validate_multimodal_prefill(
+        inputs["input_ids"][0].tolist(), multimodal_data
+    )
 
 
 # ── Batched stream dispatch ──────────────────────────────────────────────
@@ -2514,7 +2529,7 @@ async def stop_profile():
 
 def main():
     """Main entry point for the server."""
-    global engine, tokenizer, model_name, default_chat_template_kwargs, _request_logger
+    global engine, tokenizer, model_name, model_path, default_chat_template_kwargs, _request_logger
     global tool_call_parser_cls, model_starts_in_reasoning, reasoning_toggle
     global reasoning_dialect, synthetic_token_text
     global custom_message_encoder, _stream_batch_dispatcher
@@ -2608,6 +2623,7 @@ def main():
             tokenizer.chat_template = args.chat_template
             logger.info("Using inline chat template from --chat-template argument")
 
+    model_path = args.model
     model_name = args.served_model_name if args.served_model_name else args.model
     custom_message_encoder = load_custom_message_encoder(args.model)
 
