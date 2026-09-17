@@ -39,9 +39,11 @@ if TYPE_CHECKING:
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
+from atom.model_engine.load_snapshot import build_sglang_loads
 from atom.model_engine.multimodal import build_multimodal_inputs
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
+from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
 from atom.utils.gc_utils import (
     freeze_gc_heap,
@@ -151,6 +153,7 @@ reasoning_dialect: Any = None
 reasoning_toggle: tuple[str, Any, Any] | None = None
 processor: Any | None = None
 model_name: str = ""
+model_path: str = ""
 default_chat_template_kwargs: dict[str, Any] = {}
 custom_message_encoder: Any | None = None
 _seq_id_to_request_id: dict[int, str] = {}
@@ -659,10 +662,10 @@ def _load_image_from_url(url: str) -> "Image.Image":
 
 
 def _get_multimodal_processor():
-    global processor, model_name
+    global processor
     if processor is None:
-        logger.info(f"Loading multimodal processor from {model_name}...")
-        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        logger.info(f"Loading multimodal processor from {model_path}...")
+        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
     return processor
 
 
@@ -736,6 +739,18 @@ def _images_before_text(
     return reordered
 
 
+def _validate_multimodal_prefill(token_ids, multimodal_data):
+    # The vision encoder currently requires an atomic prefill. Reject before
+    # dispatch instead of turning the scheduler's rejection into empty success.
+    limit = _get_engine_config().max_num_batched_tokens
+    if len(token_ids) > limit:
+        raise ValueError(
+            f"Image-containing prompts are limited to {limit} input tokens "
+            f"on this worker; received {len(token_ids)}."
+        )
+    return token_ids, multimodal_data
+
+
 def _prepare_multimodal_inputs(
     messages: list[Any],
     chat_template_kwargs: dict[str, Any],
@@ -759,7 +774,7 @@ def _prepare_multimodal_inputs(
         tools=tools,
     )
     if built is not None:
-        return built
+        return _validate_multimodal_prefill(*built)
 
     template_kwargs = dict(chat_template_kwargs)
     template_kwargs.pop("tokenize", None)
@@ -777,7 +792,9 @@ def _prepare_multimodal_inputs(
         "pixel_values": inputs["pixel_values"],
         "image_grid_thw": inputs["image_grid_thw"],
     }
-    return inputs["input_ids"][0].tolist(), multimodal_data
+    return _validate_multimodal_prefill(
+        inputs["input_ids"][0].tolist(), multimodal_data
+    )
 
 
 # ── Batched stream dispatch ──────────────────────────────────────────────
@@ -1544,15 +1561,26 @@ async def _metrics_refresh_loop() -> None:
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
     global _metrics_refresh_task
-    logger.info("Server started successfully and ready to accept requests")
-    tune_gc()
-    maybe_attach_gc_debug_callback("api_server")
-    await _refresh_metrics_once()
-    _metrics_refresh_task = asyncio.create_task(_metrics_refresh_loop())
-    # The engine was built in `main()`, so this is the last point before the
-    # first request at which everything reachable is still startup state.
-    freeze_gc_heap("api_server")
+    # main() already owns live engine processes. Startup failure must release
+    # them just like normal shutdown, including warmup errors and timeouts.
     try:
+        if envs.ATOM_IMAGE_WARMUP:
+            from .image_warmup import warm_image_serving
+
+            await warm_image_serving(
+                tokenizer=tokenizer,
+                model_name=model_name,
+                completions=completions,
+                chat_completions=chat_completions,
+            )
+        logger.info("Server started successfully and ready to accept requests")
+        tune_gc()
+        maybe_attach_gc_debug_callback("api_server")
+        await _refresh_metrics_once()
+        _metrics_refresh_task = asyncio.create_task(_metrics_refresh_loop())
+        # The engine was built in `main()`, so this is the last point before the
+        # first request at which everything reachable is still startup state.
+        freeze_gc_heap("api_server")
         yield
     finally:
         if _metrics_refresh_task is not None:
@@ -2350,6 +2378,22 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/v1/loads")
+async def loads(include: str | None = None):
+    """SGLang-compatible engine load used by Sail's admission proxy."""
+    del include  # accepted for compatibility with ``?include=core``
+    if engine is None:
+        raise HTTPException(status_code=503, detail="engine is not initialized")
+    try:
+        return build_sglang_loads(
+            config=engine.config,
+            max_pool_tokens=engine.core_mgr.max_pool_tokens,
+            rank_stats=dict(engine.core_mgr.latest_loads),
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @app.api_route("/metrics", methods=["GET", "HEAD"], include_in_schema=False)
 async def metrics():
     """Expose cached standalone-engine metrics in Prometheus text format."""
@@ -2385,6 +2429,30 @@ async def get_cache_stats():
         raise HTTPException(
             status_code=500, detail=f"Failed to get cache statistics: {e}"
         ) from e
+
+
+@app.post("/reset_prefix_cache")
+async def reset_prefix_cache():
+    """Clear reusable prefix/state indexes after all requests have drained."""
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine is not initialized")
+    try:
+        result = engine.reset_prefix_cache()
+    except TimeoutError as e:
+        logger.exception("Timed out resetting prefix cache")
+        raise HTTPException(status_code=504, detail=str(e)) from e
+    except Exception as e:
+        logger.exception("Failed to reset prefix cache")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to reset prefix cache: {e}"
+        ) from e
+    status_code = {
+        "success": 200,
+        "busy": 409,
+        "unsupported": 409,
+        "failed": 500,
+    }.get(result.get("status"), 500)
+    return JSONResponse(status_code=status_code, content=result)
 
 
 def _resolve_kv_transfer_role(kv_cfg: dict) -> tuple[str | None, int]:
@@ -2473,7 +2541,7 @@ async def stop_profile():
 
 def main():
     """Main entry point for the server."""
-    global engine, tokenizer, model_name, default_chat_template_kwargs, _request_logger
+    global engine, tokenizer, model_name, model_path, default_chat_template_kwargs, _request_logger
     global tool_call_parser_cls, model_starts_in_reasoning, reasoning_toggle
     global reasoning_dialect, synthetic_token_text
     global custom_message_encoder, _stream_batch_dispatcher
@@ -2567,6 +2635,7 @@ def main():
             tokenizer.chat_template = args.chat_template
             logger.info("Using inline chat template from --chat-template argument")
 
+    model_path = args.model
     model_name = args.served_model_name if args.served_model_name else args.model
     custom_message_encoder = load_custom_message_encoder(args.model)
 

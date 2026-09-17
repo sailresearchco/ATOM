@@ -3,6 +3,7 @@
 
 import logging
 import queue
+import time
 from typing import ClassVar
 
 from atom.model_engine.sequence import SequenceStatus
@@ -45,6 +46,8 @@ class EngineUtilityHandler:
         "get_mtp_stats": "_handle_get_mtp_stats",
         "get_mtp_statistics": "_handle_get_mtp_statistics",
         "get_cache_statistics": "_handle_get_cache_statistics",
+        "inspect_prefix_cache": "_handle_inspect_prefix_cache",
+        "reset_prefix_cache": "_handle_reset_prefix_cache",
         "abort_request": "_handle_abort_request",
     }
 
@@ -321,6 +324,47 @@ class EngineUtilityHandler:
             ("UTILITY_RESPONSE", {"cmd": "get_cache_statistics", "result": result})
         )
 
+    def _prefix_cache_snapshot(self) -> dict:
+        scheduler = self.scheduler
+        block_manager = getattr(scheduler, "block_manager", None)
+        running, waiting = (
+            scheduler.get_request_counts() if scheduler is not None else (0, 0)
+        )
+        stats = getattr(scheduler, "engine_stats", None)
+        result = {
+            "engine_index": int(getattr(stats, "engine_index", 0)),
+            "role": getattr(scheduler, "_METRICS_ROLE", ""),
+            "supported": block_manager is not None,
+            "running_requests": int(running),
+            "waiting_requests": int(waiting),
+        }
+        if block_manager is not None:
+            result.update(block_manager.cache_index_counts())
+        return result
+
+    def _handle_inspect_prefix_cache(self, args: dict):
+        """Return an idle/count preflight without mutating cache state."""
+        self.output_queue.put_nowait(
+            (
+                "UTILITY_RESPONSE",
+                {"cmd": "inspect_prefix_cache", "result": self._prefix_cache_snapshot()},
+            )
+        )
+
+    def _handle_reset_prefix_cache(self, args: dict):
+        """Clear prefix/state indexes only while this scheduler is drained."""
+        before = self._prefix_cache_snapshot()
+        block_manager = getattr(self.scheduler, "block_manager", None)
+        busy = before["running_requests"] or before["waiting_requests"]
+        cleared = bool(block_manager is not None and not busy)
+        if cleared:
+            block_manager.clear_cache()
+        after = self._prefix_cache_snapshot()
+        result = {"cleared": cleared, "before": before, "after": after}
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "reset_prefix_cache", "result": result})
+        )
+
     def push_metrics(self) -> None:
         """Publish this rank's metrics snapshot on the output socket.
 
@@ -334,6 +378,38 @@ class EngineUtilityHandler:
         the last off-loop writer on the control socket.
         """
         self.output_queue.put_nowait(("METRICS", self.collect_metrics()))
+
+    def push_loads(self) -> None:
+        """Publish the small, high-cadence snapshot used by /v1/loads."""
+        scheduler = self.scheduler
+        if scheduler is None:
+            result = {"enabled": False}
+        else:
+            running, waiting = scheduler.get_request_counts()
+            block_manager = getattr(scheduler, "block_manager", None)
+            kv_pool = None if block_manager is None else block_manager.kv
+            result = {
+                "enabled": True,
+                # Engine-process wall clock at collection time. The API must
+                # forward this unchanged so consumers can reject a stale push.
+                "timestamp": time.time(),
+                "requests_running": running,
+                "requests_waiting": waiting,
+                "waiting_uncached_tokens": scheduler.waiting_uncached_tokens(),
+                "total_prefill_uncached_tokens": int(
+                    getattr(scheduler, "total_prefill_uncached_tokens", 0)
+                ),
+                "total_prefill_busy_us": int(
+                    getattr(scheduler, "total_prefill_busy_us", 0)
+                ),
+            }
+            if kv_pool is not None:
+                result |= {
+                    "kv_blocks_used": kv_pool.num_used,
+                    "kv_blocks_free": kv_pool.num_free,
+                    "kv_blocks_total": kv_pool.num_blocks,
+                }
+        self.output_queue.put_nowait(("LOADS", result))
 
     def collect_metrics(self) -> dict:
         """One rank's scheduler, KV, MTP, and cache metrics."""
