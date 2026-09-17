@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 ARG ATOM_BASE_IMAGE=sailresearchco/atom@sha256:5e406e193929971848a9d49cabf95d7231f6f92b7892b9d3612ca0d01fa643cb
 FROM ${ATOM_BASE_IMAGE}
 
@@ -8,9 +9,26 @@ LABEL org.opencontainers.image.source="https://github.com/sailresearchco/ATOM" \
       ai.sail.atom.source-version="${ATOM_SOURCE_VERSION}" \
       ai.sail.atom.profile="kimi-k3-mi355x-tp8-dcp8-dspark4"
 
-# The benchmark image already contains the validated gfx950 AITER wheel. Bake
-# the Sail fork into the runtime image so deploys never depend on a host bind
-# mount or on whatever source happened to be present in the base image.
+# The historical benchmark base predates K3's fused SiTUv2 activation. Install
+# the GPU artifacts qualified together on MI355X: newer AITER needs newer
+# Triton, and generic PyPI Triton produces incorrect compiled-model output.
+# Direct wheel URLs and hashes prevent a rebuild from selecting generic Triton
+# or a different nightly. Worker/Python dependency resolution is unaffected.
+ARG AITER_WHEEL=https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/amd_aiter-0.1.1.dev1%2Bgcdf6ee88a-cp312-cp312-linux_x86_64.whl#sha256=4f96d4463dadc87cf818002d72160b41715c516f46eab46446e999c10f38ff25
+ARG TRITON_WHEEL=https://pypi.amd.com/triton/_release/rocm-7.2.0/packages/triton/triton-3.8.0%2Bamd.rocm7.2.0.git111ff227-cp312-cp312-linux_x86_64.whl#sha256=a20d7e0cd0efb8ac46dd3841d3eb337d938bb0699f0ec830d296d8ebeb92cbe0
+ARG TRITON_KERNELS_WHEEL=https://pypi.amd.com/triton/_release/rocm-7.2.0/packages/triton-kernels/triton_kernels-1.0.0%2Bamd.rocm7.2.0.git111ff227-py3-none-any.whl#sha256=31b76695911f91f77736510096d7053c8db563c15f2490285a93c2ae5a487bf6
+LABEL ai.sail.atom.aiter-wheel="${AITER_WHEEL}" \
+      ai.sail.atom.triton-wheel="${TRITON_WHEEL}" \
+      ai.sail.atom.triton-kernels-wheel="${TRITON_KERNELS_WHEEL}"
+# The base also contains valid FlyDSL 0.3.2. This obsolete metadata directory
+# has no RECORD and prevents pip from resolving the installed version.
+RUN rm -rf /opt/venv/lib/python3.12/site-packages/flydsl-0.1.9.dev599.dist-info
+RUN --mount=type=cache,target=/root/.cache/pip \
+    /opt/venv/bin/python -m pip install --upgrade \
+      "${AITER_WHEEL}" "${TRITON_WHEEL}" "${TRITON_KERNELS_WHEEL}"
+
+# Bake the Sail fork into the runtime image so deploys never depend on a host
+# bind mount or on whatever source happened to be present in the base image.
 WORKDIR /opt/sail-atom
 COPY pyproject.toml setup.py MANIFEST.in README.md LICENSE ./
 COPY atom ./atom
