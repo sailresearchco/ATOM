@@ -149,7 +149,10 @@ class KimiK3PatchEmbed(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
-        x = self.proj(x).view(x.size(0), -1)
+        # Every input is exactly one patch: this is the same affine map as
+        # Conv2d, without MIOpen convolution search for each batch patch count.
+        # Keep the Conv2d parameter layout so checkpoint loading is unchanged.
+        x = F.linear(x.flatten(1), self.proj.weight.flatten(1), self.proj.bias)
         return self.pos_emb(x, grid_thws)
 
 
