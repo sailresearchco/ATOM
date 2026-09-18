@@ -8,6 +8,8 @@ import asyncio
 import inspect
 import json
 import pathlib
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -40,6 +42,63 @@ from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
 from atom.entrypoints.openai.tool_parser.qwen3_tool_parser import QwenXmlParser
 from atom.entrypoints.openai.tool_parser.registry import forbids_tool_calls
 from atom.entrypoints.openai.tool_parser.tool_parser import usable_tool_name
+
+
+@pytest.mark.parametrize("fanout", [False, True])
+@pytest.mark.parametrize("coalesced", [False, True])
+def test_stream_usage_preserves_engine_timing(monkeypatch, fanout, coalesced):
+    """Slow SSE consumers and tokenless terminal chunks must not skew timing."""
+    monkeypatch.setitem(api_server._request_start_times, "timed", 100.0)
+
+    async def run():
+        collector = StreamOutputCollector("timed") if coalesced else asyncio.Queue()
+        for sibling in range(2 if fanout else 1):
+            # The terminal callback carries no tokens; the last token was
+            # produced earlier. Fan-out sibling 1 has deliberately slower TTFT.
+            for ts, tokens, finished in (
+                (100.25 + sibling, [], False),
+                (101.0 + sibling, [1], False),
+                (103.0 + sibling, [2, 3], False),
+                (104.0 + sibling, [], True),
+            ):
+                output = SimpleNamespace(
+                    output_tokens=tokens,
+                    finished=finished,
+                    finish_reason="stop" if finished else None,
+                )
+                with patch.object(api_server.time, "time", return_value=ts):
+                    chunk = api_server._build_stream_chunk(output, "timed")
+                chunk["text"] = "x" * len(tokens)
+                collector.put_nowait((sibling, chunk) if fanout else chunk)
+        common = dict(
+            request_id="timed",
+            model="model",
+            num_prompt_tokens=5,
+            cleanup_stream=lambda *a, **k: None,
+            cleanup_request=lambda *a, **k: None,
+        )
+        generator = (
+            stream_chat_response_fanout(
+                shared_collector=collector, seq_ids=[0, 1], **common
+            )
+            if fanout
+            else stream_chat_response(stream_collector=collector, seq_id=0, **common)
+        )
+        frames = [raw async for raw in generator]
+        events = [
+            json.loads(line[6:])
+            for raw in frames
+            for line in raw.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        return next(event["usage"] for event in events if event.get("usage"))
+
+    usage = asyncio.run(run())
+    assert usage["ttft_s"] == (2.0 if fanout else 1.0)
+    assert usage["latency_s"] == (5.0 if fanout else 4.0)
+    assert usage["tpot_s"] == 1.0
+    assert usage["completion_tokens"] == (6 if fanout else 3)
+
 
 # ============================================================================
 # normalize_chat_tools Tests

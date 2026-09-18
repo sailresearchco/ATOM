@@ -22,7 +22,7 @@ from .reasoning import (
     ReasoningChannel,
 )
 from .sse import data_frame
-from .streaming_dispatch import StreamOutputCollector
+from .streaming_dispatch import StreamOutputCollector, StreamTiming
 from .tool_parser import ToolCallStreamParser, parse_tool_calls
 from .tool_parser.registry import forbids_tool_calls
 from .tool_parser.tool_parser import usable_tool_name
@@ -262,6 +262,7 @@ async def stream_chat_response(
     """
     num_tokens_input = num_prompt_tokens
     num_tokens_output = 0
+    timing = StreamTiming()
     num_cached_tokens = 0
     # The engine's own reason, kept so the final chunk can report it. The
     # streaming paths hardcoded `stop`, so a response the engine cut off at
@@ -287,6 +288,7 @@ async def stream_chat_response(
         role_sent = False
         while True:
             chunk_data = await stream_collector.get()
+            timing.update(chunk_data)
 
             if not role_sent:
                 yield create_chat_chunk(
@@ -367,6 +369,7 @@ async def stream_chat_response(
             "completion_tokens": num_tokens_output,
             "total_tokens": num_tokens_input + num_tokens_output,
             "prompt_tokens_details": {"cached_tokens": num_cached_tokens},
+            **timing.usage(num_tokens_output),
         }
         usage_chunk = {
             "id": request_id,
@@ -569,6 +572,7 @@ async def stream_chat_response_fanout(
     n = len(seq_ids)
     num_tokens_input = num_prompt_tokens
     num_tokens_output = [0] * n
+    timings = [StreamTiming() for _ in range(n)]
     # Every sibling answers the same prompt, so they start in the same state.
     reasoning_filters = [reasoning.stream() for _ in range(n)]
     tool_parsers = [
@@ -607,6 +611,7 @@ async def stream_chat_response_fanout(
             if finished[idx]:
                 # Defensive: should not happen, engine emits finished once per seq.
                 continue
+            timings[idx].update(chunk_data)
             new_text = chunk_data["text"]
             if chunk_data.get("finish_reason"):
                 engine_finish_reasons[idx] = chunk_data["finish_reason"]
@@ -685,6 +690,12 @@ async def stream_chat_response_fanout(
             "num_choices": n,
             "prompt_tokens_details": {"cached_tokens": num_cached_tokens},
         }
+        # Match buffered fan-out: report the slowest sibling for each timing.
+        timing_usage = [t.usage(count) for t, count in zip(timings, num_tokens_output)]
+        if all(timing_usage):
+            usage.update(
+                {key: max(t[key] for t in timing_usage) for key in timing_usage[0]}
+            )
         usage_chunk = {
             "id": request_id,
             "object": CHAT_COMPLETION_CHUNK_OBJECT,

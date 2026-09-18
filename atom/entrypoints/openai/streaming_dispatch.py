@@ -106,6 +106,53 @@ def merge_chunk(into: dict, new: dict) -> None:
     for key in _LATEST_WINS:
         if new.get(key):
             into[key] = new[key]
+    # Preserve engine callback times across coalescing. Socket delivery and
+    # detokenization may lag the engine, so neither can define token timing.
+    for key in ("started_at", "first_token_at"):
+        if into.get(key) is None and new.get(key) is not None:
+            into[key] = new[key]
+    for key in ("last_token_at", "finished_at"):
+        if new.get(key) is not None:
+            into[key] = new[key]
+
+
+@dataclass
+class StreamTiming:
+    """Engine callback timing for one sequence, including merged chunks."""
+
+    started_at: float | None = None
+    first_token_at: float | None = None
+    last_token_at: float | None = None
+    finished_at: float | None = None
+
+    def update(self, chunk: dict) -> None:
+        for key in ("started_at", "first_token_at"):
+            if getattr(self, key) is None and chunk.get(key) is not None:
+                setattr(self, key, chunk[key])
+        for key in ("last_token_at", "finished_at"):
+            if chunk.get(key) is not None:
+                setattr(self, key, chunk[key])
+
+    def usage(self, output_tokens: int) -> dict[str, float]:
+        if self.started_at is None or self.finished_at is None:
+            return {}
+        ttft = (
+            self.first_token_at - self.started_at
+            if self.first_token_at is not None
+            else 0.0
+        )
+        tpot = (
+            (self.last_token_at - self.first_token_at) / (output_tokens - 1)
+            if self.first_token_at is not None
+            and self.last_token_at is not None
+            and output_tokens > 1
+            else 0.0
+        )
+        return {
+            "ttft_s": round(ttft, 4),
+            "tpot_s": round(tpot, 4),
+            "latency_s": round(self.finished_at - self.started_at, 4),
+        }
 
 
 class StreamOutputCollector:

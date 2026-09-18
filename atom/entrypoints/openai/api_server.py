@@ -804,12 +804,15 @@ def _prepare_multimodal_inputs(
 def _build_stream_chunk(request_output: RequestOutput, request_id: str) -> dict:
     """Build a raw chunk; detokenization happens once in the batch dispatcher."""
     started_at = _request_start_times.get(request_id)
+    now = time.time()
     chunk_data = {
         "token_ids": request_output.output_tokens,
         "finished": request_output.finished,
         "finish_reason": request_output.finish_reason,
-        "finished_at": time.time(),
+        "finished_at": now,
         "started_at": started_at,
+        "first_token_at": now if request_output.output_tokens else None,
+        "last_token_at": now if request_output.output_tokens else None,
         "num_cached_tokens": getattr(request_output, "num_cached_tokens", 0),
     }
     if getattr(request_output, "kv_transfer_params_output", None):
