@@ -22,8 +22,9 @@ ARG TRITON_KERNELS_WHEEL=https://pypi.amd.com/triton/_release/rocm-7.2.0/package
 LABEL ai.sail.atom.aiter-wheel="${AITER_WHEEL}" \
       ai.sail.atom.triton-wheel="${TRITON_WHEEL}" \
       ai.sail.atom.triton-kernels-wheel="${TRITON_KERNELS_WHEEL}"
-# The base also contains valid FlyDSL 0.3.2. This obsolete metadata directory
-# has no RECORD and prevents pip from resolving the installed version.
+# Remove the editable AITER source shadow and obsolete FlyDSL metadata.
+# The metadata has no RECORD and prevents pip from upgrading FlyDSL; the
+# qualified AITER wheel below selects the matching FlyDSL 0.3.2 package.
 RUN /opt/venv/bin/python -m pip uninstall -y amd-aiter \
  && rm -rf /app/aiter-test \
            /opt/venv/lib/python3.12/site-packages/flydsl-0.1.9.dev599.dist-info
