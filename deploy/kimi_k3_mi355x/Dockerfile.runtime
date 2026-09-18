@@ -36,5 +36,6 @@ COPY deploy/kimi_k3_mi355x ./deploy/kimi_k3_mi355x
 ENV ATOM_MESH_BUILD=0 \
     ATOM_IMAGE_WARMUP=1 \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ATOM=${ATOM_SOURCE_VERSION}
-RUN python -m pip install --no-cache-dir --no-deps --force-reinstall \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    /opt/venv/bin/python -m pip install --no-deps --force-reinstall \
       --editable /opt/sail-atom
