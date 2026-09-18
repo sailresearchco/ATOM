@@ -93,7 +93,7 @@ case "${action}" in
     version="0.1.6rc1.dev382+g${revision:0:8}.sail"
     image="${ATOM_IMAGE:?ATOM_IMAGE must be set to the output tag}"
     "${docker_cmd[@]}" build \
-      --build-arg "ATOM_BASE_IMAGE=${ATOM_BASE_IMAGE:-sailresearchco/atom@sha256:5e406e193929971848a9d49cabf95d7231f6f92b7892b9d3612ca0d01fa643cb}" \
+      --build-arg "ATOM_BASE_IMAGE=${ATOM_BASE_IMAGE:-rocm/atom@sha256:13d8564eeef3a267c1cc25410c78029097bd8f218b71ef37d32df971d73d25bb}" \
       --build-arg "ATOM_SOURCE_COMMIT=${revision}" \
       --build-arg "ATOM_SOURCE_VERSION=${version}" \
       --file "${script_dir}/Dockerfile.runtime" \
