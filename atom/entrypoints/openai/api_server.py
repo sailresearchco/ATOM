@@ -645,21 +645,32 @@ def _load_image_from_url(url: str) -> "Image.Image":
     # server; a request that actually carries an image raises here, naming it.
     from PIL import Image
 
+    def decode_image(source):
+        try:
+            with Image.open(source) as image:
+                return image.convert("RGB")
+        except (OSError, SyntaxError, Image.DecompressionBombError) as exc:
+            # Pillow decodes pixels lazily, so conversion must be covered too.
+            # Keep acquisition errors outside this boundary: only malformed or
+            # unsafe image content is a request validation error.
+            raise ValueError("Invalid or unsupported image data for image_url") from exc
+
     if url.startswith("data:"):
         try:
             _, encoded = url.split(",", 1)
             image_bytes = base64.b64decode(encoded, validate=True)
         except (ValueError, binascii.Error) as exc:
             raise ValueError("Invalid base64 data URL for image_url") from exc
-        return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        return decode_image(io.BytesIO(image_bytes))
 
     if url.startswith(("http://", "https://")):
         with urllib.request.urlopen(url, timeout=30) as response:
             image_bytes = response.read()
-        return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        return decode_image(io.BytesIO(image_bytes))
 
     url = url.removeprefix("file://")
-    return Image.open(url).convert("RGB")
+    with open(url, "rb") as source:
+        return decode_image(source)
 
 
 def _get_multimodal_processor():
